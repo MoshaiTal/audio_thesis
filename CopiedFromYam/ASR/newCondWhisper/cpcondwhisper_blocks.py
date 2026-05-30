@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -24,13 +24,19 @@ def make_time_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
 
 class CPConditioner(nn.Module):
     """
-    Builds local + global CP-conditioned representations from pred/lower/upper/width.
-    The design is intentionally small and safe.
+    Builds local + global CP-conditioned representations.
+
+    Important change from the previous version:
+    This receives richer uncertainty features:
+      pred, lower, upper, raw width, log width, pred-lower, upper-pred.
+
+    The previous version used only per-sample normalized width, which can erase
+    global uncertainty scale. This version keeps raw and log-scaled information.
     """
 
-    def __init__(self, mel_bins: int = 80, d_cond: int = 128):
+    def __init__(self, mel_bins: int = 80, d_cond: int = 128, cond_feature_groups: int = 6):
         super().__init__()
-        in_ch = mel_bins * 4  # pred, lower, upper, width
+        in_ch = mel_bins * (1 + cond_feature_groups)  # pred + uncertainty feature groups
         self.local_net = nn.Sequential(
             nn.Conv1d(in_ch, 192, kernel_size=7, padding=3),
             nn.GELU(),
@@ -46,13 +52,11 @@ class CPConditioner(nn.Module):
     def forward(
         self,
         pred: torch.Tensor,
-        lower: torch.Tensor,
-        upper: torch.Tensor,
+        cp_features: torch.Tensor,
         input_lengths: torch.Tensor,
         target_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        width = (upper - lower).abs()
-        x = torch.cat([pred, lower, upper, width], dim=1)  # [B, 320, T]
+        x = torch.cat([pred, cp_features], dim=1)
         local = self.local_net(x)  # [B, d_cond, T]
         local_ds = F.adaptive_avg_pool1d(local, target_seq_len).transpose(1, 2)  # [B, S, d_cond]
 
@@ -66,15 +70,18 @@ class CPConditioner(nn.Module):
 class LatentCondSABlock(nn.Module):
     """
     Condformer-style latent conditional self-attention block.
-    It operates on Whisper encoder latent states and conditions Q/K on CP features.
-    The block is zero-initialized at the residual gates so the full model starts
-    as plain Whisper-on-pred.
+
+    Crucial fix:
+    the old version zero-initialized both the residual gates and the output
+    projections. That makes the block an exact no-op with no useful gradient.
+    This version starts very close to no-op, but not exactly no-op.
     """
 
     def __init__(self, d_model: int, d_cond: int, num_heads: int = 8, mlp_ratio: float = 4.0):
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError(f"d_model={d_model} must be divisible by num_heads={num_heads}")
+
         self.d_model = d_model
         self.d_cond = d_cond
         self.num_heads = num_heads
@@ -99,21 +106,21 @@ class LatentCondSABlock(nn.Module):
             nn.Linear(hidden_dim, d_model),
         )
 
-        # Safe initialization: the conditioning path starts as no-op.
-        nn.init.zeros_(self.q_lfm.weight)
+        # Near-identity initialization with a live gradient path.
+        nn.init.normal_(self.q_lfm.weight, mean=0.0, std=1e-4)
         nn.init.zeros_(self.q_lfm.bias)
-        nn.init.zeros_(self.k_lfm.weight)
+        nn.init.normal_(self.k_lfm.weight, mean=0.0, std=1e-4)
         nn.init.zeros_(self.k_lfm.bias)
-        nn.init.zeros_(self.out_proj.weight)
+        nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-4)
         nn.init.zeros_(self.out_proj.bias)
-        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.normal_(self.ffn[-1].weight, mean=0.0, std=1e-4)
         nn.init.zeros_(self.ffn[-1].bias)
 
-        self.attn_gate = nn.Parameter(torch.zeros(1))
-        self.ffn_gate = nn.Parameter(torch.zeros(1))
+        self.attn_gate = nn.Parameter(torch.tensor(0.01))
+        self.ffn_gate = nn.Parameter(torch.tensor(0.01))
 
     def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
-        bsz, seq_len, dim = x.shape
+        bsz, seq_len, _ = x.shape
         x = x.view(bsz, seq_len, self.num_heads, self.head_dim)
         return x.transpose(1, 2)  # [B, H, S, Dh]
 
@@ -143,7 +150,7 @@ class LatentCondSABlock(nn.Module):
             scores = scores.masked_fill(~keep, -1e4)
 
         attn = torch.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v)  # [B, H, S, Dh]
+        out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(hidden_states.size(0), hidden_states.size(1), self.d_model)
         out = self.out_proj(out)
 
@@ -163,8 +170,7 @@ class CPCondWhisperModel(nn.Module):
     Pipeline:
       pred -> frozen Whisper encoder -> latent CP-conditioned blocks -> Whisper decoder
 
-    This mirrors the Condformer idea of conditioning the latent module, while keeping
-    inference dependent only on dereverb + CP outputs.
+    The conditioner receives pred + normalized CP width.
     """
 
     def __init__(
@@ -172,6 +178,7 @@ class CPCondWhisperModel(nn.Module):
         model_name: str = "openai/whisper-small",
         mel_bins: int = 80,
         d_cond: int = 128,
+        cond_feature_groups: int = 6,
         num_latent_blocks: int = 4,
         num_heads: int = 8,
         freeze_whisper: bool = True,
@@ -183,7 +190,11 @@ class CPCondWhisperModel(nn.Module):
                 p.requires_grad = False
 
         d_model = self.base.model.config.d_model
-        self.conditioner = CPConditioner(mel_bins=mel_bins, d_cond=d_cond)
+        self.conditioner = CPConditioner(
+            mel_bins=mel_bins,
+            d_cond=d_cond,
+            cond_feature_groups=cond_feature_groups,
+        )
         self.latent_blocks = nn.ModuleList(
             [LatentCondSABlock(d_model=d_model, d_cond=d_cond, num_heads=num_heads) for _ in range(num_latent_blocks)]
         )
@@ -191,16 +202,15 @@ class CPCondWhisperModel(nn.Module):
     def encode_and_condition(
         self,
         pred: torch.Tensor,
-        lower: torch.Tensor,
-        upper: torch.Tensor,
+        cp_features: torch.Tensor,
         input_lengths: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         enc = self.base.model.encoder(input_features=pred, return_dict=True)
         base_hidden = enc.last_hidden_state  # [B, S, D]
         seq_len = base_hidden.size(1)
-        cond_local, cond_global = self.conditioner(pred, lower, upper, input_lengths, seq_len)
+        cond_local, cond_global = self.conditioner(pred, cp_features, input_lengths, seq_len)
 
-        enc_lengths = expected_encoder_len(input_lengths)
+        enc_lengths = expected_encoder_len(input_lengths).clamp(max=seq_len)
         enc_mask = make_time_mask(enc_lengths, seq_len)
 
         hidden = base_hidden
@@ -212,13 +222,12 @@ class CPCondWhisperModel(nn.Module):
     def forward(
         self,
         pred: torch.Tensor,
-        lower: torch.Tensor,
-        upper: torch.Tensor,
+        cp_features: torch.Tensor,
         input_lengths: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         decoder_attention_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        base_hidden, refined_hidden, enc_mask = self.encode_and_condition(pred, lower, upper, input_lengths)
+        base_hidden, refined_hidden, enc_mask = self.encode_and_condition(pred, cp_features, input_lengths)
         outputs = self.base(
             encoder_outputs=BaseModelOutput(last_hidden_state=refined_hidden),
             attention_mask=enc_mask.long(),
@@ -239,12 +248,11 @@ class CPCondWhisperModel(nn.Module):
     def generate(
         self,
         pred: torch.Tensor,
-        lower: torch.Tensor,
-        upper: torch.Tensor,
+        cp_features: torch.Tensor,
         input_lengths: torch.Tensor,
         **generate_kwargs,
     ) -> torch.Tensor:
-        _, refined_hidden, enc_mask = self.encode_and_condition(pred, lower, upper, input_lengths)
+        _, refined_hidden, enc_mask = self.encode_and_condition(pred, cp_features, input_lengths)
         return self.base.generate(
             encoder_outputs=BaseModelOutput(last_hidden_state=refined_hidden),
             attention_mask=enc_mask.long(),
