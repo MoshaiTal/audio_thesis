@@ -8,7 +8,7 @@ from CopiedFromYam.BACKBONE.CALIBRATION.krcps_yam.calibrate_from_main import run
 from CopiedFromYam.BACKBONE.MODEL_SECTION.data_loader import load_data
 from CopiedFromYam.BACKBONE.MODEL_SECTION.model_creator import create_model
 from CopiedFromYam.BACKBONE.MODEL_SECTION.criterions_and_optimizers_tree import (set_optimizer, set_criterion, set_scheduler)
-from CopiedFromYam.BACKBONE.MODEL_SECTION.training_page_same_alpha import training_loop, evaluate_individual_heads
+from CopiedFromYam.BACKBONE.MODEL_SECTION.training_page_same_alpha_asr_aware import training_loop
 from CopiedFromYam.BACKBONE.MODEL_SECTION.load_config import load_config
 from CopiedFromYam.set_env import (set_device, set_seed, create_check_points_file, create_weights_folder, create_output_folder)
 
