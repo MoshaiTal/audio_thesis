@@ -51,6 +51,92 @@ def freq_delta_loss(pred: torch.Tensor, target: torch.Tensor, mask: Optional[tor
     return _masked_mean(loss, delta_mask)
 
 
+def soft_speech_activity_mask(
+    clean_spec: torch.Tensor,
+    valid_mask: Optional[torch.Tensor] = None,
+    threshold_quantile: float = 0.30,
+    temperature: float = 0.08,
+) -> torch.Tensor:
+    """
+    Return a soft [B,1,T] speech-activity mask derived from the clean target.
+
+    The model is trained on normalized log spectra, so the mean value across
+    frequency is a stable relative frame-energy proxy. A per-utterance
+    quantile avoids requiring the original waveform scale.
+    """
+    if clean_spec.dim() != 3:
+        raise ValueError(f"Expected clean spectrum [B,F,T], got {tuple(clean_spec.shape)}")
+
+    frame_score = clean_spec.mean(dim=1, keepdim=True)
+    if valid_mask is not None:
+        if valid_mask.dim() == 3:
+            valid_time = valid_mask.amax(dim=1, keepdim=True) > 0.5
+        elif valid_mask.dim() == 2:
+            valid_time = valid_mask.unsqueeze(1) > 0.5
+        else:
+            raise ValueError(f"Expected valid mask [B,F,T] or [B,T], got {tuple(valid_mask.shape)}")
+    else:
+        valid_time = torch.ones_like(frame_score, dtype=torch.bool)
+
+    thresholds = []
+    for batch_idx in range(frame_score.shape[0]):
+        values = frame_score[batch_idx][valid_time[batch_idx]]
+        if values.numel() == 0:
+            thresholds.append(frame_score.new_tensor(0.0))
+        else:
+            thresholds.append(torch.quantile(values.detach(), threshold_quantile))
+    threshold = torch.stack(thresholds).view(-1, 1, 1)
+
+    speech = torch.sigmoid((frame_score - threshold) / max(float(temperature), 1e-4))
+    return speech * valid_time.to(dtype=clean_spec.dtype)
+
+
+def mid_speech_losses(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    start_bin: int = 32,
+    end_bin: int = 129,
+    speech_quantile: float = 0.30,
+    speech_temperature: float = 0.08,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    L1 and temporal-delta losses in the ASR-critical 1-4 kHz region.
+
+    With a 512-point STFT at 16 kHz, bins 32:129 correspond approximately
+    to 1-4 kHz. The soft clean-speech mask prevents silence from dominating.
+    """
+    pred, target = _match_time(pred, target)
+    end_bin = min(end_bin, pred.shape[-2], target.shape[-2])
+    start_bin = min(start_bin, end_bin)
+    if end_bin <= start_bin:
+        zero = pred.new_tensor(0.0)
+        return zero, zero
+
+    speech = soft_speech_activity_mask(
+        target,
+        valid_mask=mask,
+        threshold_quantile=speech_quantile,
+        temperature=speech_temperature,
+    )
+    pred_mid = pred[:, start_bin:end_bin, :]
+    target_mid = target[:, start_bin:end_bin, :]
+    speech_mid = speech.expand(-1, end_bin - start_bin, -1)
+
+    if mask is not None:
+        valid_mid = mask[:, start_bin:end_bin, :]
+        speech_mid = speech_mid * valid_mid
+
+    l1 = _masked_mean(torch.abs(pred_mid - target_mid), speech_mid)
+    delta_error = torch.abs(
+        (pred_mid[..., 1:] - pred_mid[..., :-1])
+        - (target_mid[..., 1:] - target_mid[..., :-1])
+    )
+    delta_mask = speech_mid[..., 1:] * speech_mid[..., :-1]
+    time_delta = _masked_mean(delta_error, delta_mask)
+    return l1, time_delta
+
+
 def mel_modulation_loss(
     pred_mel: torch.Tensor,
     target_mel: torch.Tensor,
@@ -213,6 +299,8 @@ class DereverbLossWeights:
     mel_time_delta: float = 0.25
     mel_freq_delta: float = 0.10
     mel_modulation: float = 0.15
+    mid_speech_l1: float = 0.0
+    mid_speech_time_delta: float = 0.0
     residual_to_reverb: float = 0.02
     mrstft: float = 0.0
     whisper_logmel: float = 0.0
@@ -283,6 +371,17 @@ class ASRAwareDereverbLoss(nn.Module):
             if self.weights.mel_modulation > 0
             else pred_mel.new_tensor(0.0)
         )
+        if self.weights.mid_speech_l1 > 0 or self.weights.mid_speech_time_delta > 0:
+            mid_l1, mid_time_delta = mid_speech_losses(
+                pred_mel,
+                clean_mel,
+                mask=mask,
+            )
+            terms["mid_speech_l1"] = mid_l1
+            terms["mid_speech_time_delta"] = mid_time_delta
+        else:
+            terms["mid_speech_l1"] = pred_mel.new_tensor(0.0)
+            terms["mid_speech_time_delta"] = pred_mel.new_tensor(0.0)
 
         if reverb_mel is not None and self.weights.residual_to_reverb > 0:
             reverb_mel, pred_for_res = _match_time(reverb_mel, pred_mel)
@@ -329,11 +428,13 @@ def make_default_asr_aware_loss(sample_rate: int = 16000) -> ASRAwareDereverbLos
     """
     weights = DereverbLossWeights(
         mel_l1=1.0,
-        mel_time_delta=0.45,
+        mel_time_delta=0.25,
         mel_freq_delta=0.10,
-        mel_modulation=0.05,
+        mel_modulation=0.15,
+        mid_speech_l1=0.0,
+        mid_speech_time_delta=0.0,
         residual_to_reverb=0.02,
-        mrstft=0.0,
-        whisper_logmel=0.0,
+        mrstft=0.10,
+        whisper_logmel=0.20,
     )
     return ASRAwareDereverbLoss(weights=weights, sample_rate=sample_rate)

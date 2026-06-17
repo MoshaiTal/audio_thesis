@@ -47,10 +47,16 @@ def _build_asr_aware_head0_loss(device) -> ASRAwareDereverbLoss:
     """ASR-friendly loss for head 0, the dereverb point estimate."""
     weights = DereverbLossWeights(
         mel_l1=1.0,
-        mel_time_delta=0.40,
+        mel_time_delta=0.35,
         mel_freq_delta=0.10,
         mel_modulation=0.05,
+        # V12's targeted regional terms did not improve WER. V13 keeps the
+        # best V10 loss and changes only the model's output formulation.
+        mid_speech_l1=0.0,
+        mid_speech_time_delta=0.0,
         residual_to_reverb=0.02,
+        # This trainer works on mel/spec chunks, not waveform, so keep waveform
+        # losses disabled here.
         mrstft=0.0,
         whisper_logmel=0.0,
     )
