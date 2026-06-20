@@ -19,6 +19,38 @@ def create_model():
             config["Model params"]["split location"],
         )
 
+    if architecture == "vanilla_mel_padded":
+        from CopiedFromYam.BACKBONE.MODEL_SECTION.model_corr_tree_mel_padded import (
+            MelPaddedSplitUNet,
+        )
+
+        mel_cfg = config["Model params"].get("mel_padded", {})
+        return MelPaddedSplitUNet(
+            ngf=config["Model params"]["ngf"],
+            nc=config["General"]["mics_num"],
+            kernel_size=config["Model params"]["kernel_size"][
+                config["Model params"]["kernel_type"]
+            ],
+            split_location=config["Model params"]["split location"],
+            padded_freq_bins=int(mel_cfg.get("padded_freq_bins", 256)),
+            pad_value=float(mel_cfg.get("pad_value", 0.0)),
+        )
+
+    if architecture == "vanilla_mel_native":
+        from CopiedFromYam.BACKBONE.MODEL_SECTION.model_corr_tree_mel_native import (
+            MelNativeSplitUNet,
+        )
+
+        mel_cfg = config["Model params"].get("mel_native", {})
+        return MelNativeSplitUNet(
+            ngf=config["Model params"]["ngf"],
+            nc=config["General"]["mics_num"],
+            kernel_size=config["Model params"]["kernel_size"][
+                config["Model params"]["kernel_type"]
+            ],
+            split_location=mel_cfg.get("split_location", None),
+        )
+
     if architecture == "residual":
         from CopiedFromYam.BACKBONE.MODEL_SECTION.model_corr_tree_residual import (
             ResidualSplitUNet,
@@ -80,4 +112,3 @@ def create_model():
         )
 
     raise ValueError(f"Unknown U-Net architecture: {architecture}")
-
