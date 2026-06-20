@@ -15,6 +15,7 @@ from DEREVERB_UNET.utils import (
     reconstruct_from_batch,
 )
 from DEREVERB_UNET.weights import save_best_weights
+from DEREVERB_UNET.weights import save_last_checkpoint
 
 
 config = load_config()
@@ -41,6 +42,7 @@ def training_loop(
     device,
     best_val_loss,
     current_config,
+    start_epoch=0,
 ):
     if isinstance(model, torch.nn.DataParallel):
         model = model.module
@@ -75,7 +77,7 @@ def training_loop(
         )
         print(f"Number of trainable parameters: {trainable_params}")
 
-    for epoch in range(current_config["current_step"]["num_epochs"]):
+    for epoch in range(start_epoch, current_config["current_step"]["num_epochs"]):
         print(f"\nEpoch {epoch + 1} out of {current_config['current_step']['num_epochs']}")
 
         train_loss, model = train(
@@ -114,6 +116,9 @@ def training_loop(
             scheduler.step(val_loss[heads_to_train].mean())
         else:
             scheduler.step()
+
+        if config["General"]["save_weights"]:
+            save_last_checkpoint(model, optimizer, scheduler, epoch, best_val_loss)
 
         for param_group in optimizer.param_groups:
             print(f"Current Learning Rate: {param_group['lr']}")
@@ -376,4 +381,3 @@ def evaluate_individual_heads(model, data_loader, criterion, device, current_con
     all_targets = np.concatenate(all_targets)
     all_input = np.concatenate(all_input)
     return running_losses, all_model_outputs, all_targets, all_input
-

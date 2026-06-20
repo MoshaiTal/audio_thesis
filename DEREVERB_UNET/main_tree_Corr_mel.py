@@ -18,6 +18,7 @@ from DEREVERB_UNET.training_page_same_alpha_mel import (
     training_loop,
 )
 from DEREVERB_UNET.weights import load_best_weights
+from DEREVERB_UNET.weights import load_training_checkpoint
 from DEREVERB_UNET.set_env import (
     create_check_points_file,
     create_output_folder,
@@ -49,6 +50,7 @@ def main(current_config):
 
     core_model = model.module if isinstance(model, nn.DataParallel) else model
     best_val_loss = np.array([np.inf] * len(core_model.heads))
+    start_epoch = 0
 
     if current_config["current_step"]["training_phase"][0] in {"retrain", "eval"}:
         model, best_val_loss = load_best_weights(
@@ -59,6 +61,15 @@ def main(current_config):
     optimizer = set_optimizer(model, current_config)
     scheduler = set_scheduler(optimizer, current_config)
     criterion = set_criterion(current_config, device)
+
+    if current_config["current_step"]["training_phase"][0] == "resume":
+        model, optimizer, scheduler, loaded_best_val_loss, start_epoch = load_training_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+        )
+        if loaded_best_val_loss is not None:
+            best_val_loss = loaded_best_val_loss
 
     if current_config["current_step"]["training_phase"][0] != "eval":
         training_loop(
@@ -71,6 +82,7 @@ def main(current_config):
             device,
             best_val_loss,
             current_config,
+            start_epoch=start_epoch,
         )
     else:
         _, val_output, val_target, val_inputs = evaluate_individual_heads(
@@ -117,4 +129,3 @@ if __name__ == "__main__":
         current["scheduler_params"] = step["scheduler"]["params"]
         print(current)
         main(current_config)
-
