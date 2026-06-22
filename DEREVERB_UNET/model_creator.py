@@ -1,34 +1,40 @@
-from DEREVERB_UNET.load_config import *
+try:
+    from DEREVERB_UNET.load_config import load_config
+except ModuleNotFoundError:
+    from load_config import load_config
 
 
 config = load_config()
 
 
 def create_model():
-    if config["Model params"]["unet_arch"] == "vanilla_mel":
-        from DEREVERB_UNET.model_corr_tree_mel import (
-            MelSplitUNet,
-        )
+    arch = config["Model params"]["unet_arch"]
 
-        return MelSplitUNet(
+    if arch == "stft_to_whisper_mel":
+        try:
+            from DEREVERB_UNET.model_corr_tree_stft_to_whisper_mel import (
+                STFTToWhisperMelUNet,
+            )
+        except ModuleNotFoundError:
+            from model_corr_tree_stft_to_whisper_mel import STFTToWhisperMelUNet
+
+        return STFTToWhisperMelUNet(
             config["Model params"]["ngf"],
             config["General"]["mics_num"],
-            config["Model params"]["kernel_size"][
-                config["Model params"]["kernel_type"]
-            ],
-            config["Model params"].get("mel split location", 3),
-        )
-
-    if config["Model params"]["unet_arch"] == "vanilla":
-        from DEREVERB_UNET.model_corr_tree import SplitUNet
-
-        return SplitUNet(
-            config["Model params"]["ngf"],
-            config["General"]["mics_num"],
-            config["Model params"]["kernel_size"][
-                config["Model params"]["kernel_type"]
-            ],
+            config["Model params"]["kernel_size"][config["Model params"]["kernel_type"]],
             config["Model params"]["split location"],
         )
 
-    raise ValueError(f"Unsupported U-Net architecture for this run: {config['Model params']['unet_arch']}")
+    if arch == "vanilla":
+        try:
+            from DEREVERB_UNET.model_corr_tree import SplitUNet
+        except ModuleNotFoundError:
+            from model_corr_tree import SplitUNet
+        return SplitUNet(
+            config["Model params"]["ngf"],
+            config["General"]["mics_num"],
+            config["Model params"]["kernel_size"][config["Model params"]["kernel_type"]],
+            config["Model params"]["split location"],
+        )
+
+    raise ValueError(f"Unsupported unet_arch: {arch}")
