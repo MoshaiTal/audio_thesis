@@ -37,7 +37,9 @@ class ReverbDataset(Dataset):
         self.target_total_T = 3000
         self.input_freq_bins = 256
         self.target_freq_bins = 80
-        self.spec_pad_value = float(np.log(1e-8))
+        # Must match prep_data_BIUREV_whisper_aligned.py:
+        # STFT input is log10(power) with floor 1e-10, padded with log10(1e-10).
+        self.spec_pad_value = float(np.log10(1e-10))
 
         self.input_root = os.path.join(data_base_path, "reverb_spec", data_part)
         self.target_root = os.path.join(data_base_path, "clean_whisper_melspec", data_part)
@@ -72,7 +74,11 @@ class ReverbDataset(Dataset):
         inferred = self._valid_time_from_spec(input_spec)
         if parsed is None:
             return inferred
-        return int(max(1, min(parsed, inferred, self.target_total_T)))
+        # The filename length is written by the prep script from the same
+        # Whisper-aligned 10 ms frame grid. Use it as the source of truth.
+        # Taking max(parsed, inferred) can turn padded tails into real speech
+        # when the pad value changes, making the loss dominated by padding.
+        return int(max(1, min(parsed, self.target_total_T)))
 
     def _load_or_create_spec_train_minmax(self):
         if os.path.exists(self.norm_stats_path):

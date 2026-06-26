@@ -51,40 +51,24 @@ def main(current_config, step_index):
 
     start_epoch = 0
     phase = current_config["current_step"]["training_phase"][0]
-    base_path = config["General"]["weights_path"]
-    last_path = make_ckpt_path(base_path, "last")
-    best_path = make_ckpt_path(base_path, "best")
-    force_restart = os.environ.get("FORCE_RESTART", "0") == "1"
-
-    load_path = None
-    if phase == "eval":
-        if os.path.exists(best_path):
-            load_path = best_path
-        elif os.path.exists(last_path):
-            load_path = last_path
-    elif not force_restart:
-        # Training should resume from the last completed epoch whenever a
-        # last-checkpoint exists, even if the config phase is train_from_scratch.
-        if os.path.exists(last_path):
-            load_path = last_path
-        elif phase == "retrain" and os.path.exists(best_path):
-            load_path = best_path
-
-    if load_path is not None:
-        model, optimizer, start_epoch, ckpt_best_val = load_checkpoint(
-            model,
-            optimizer,
-            load_path,
-            map_location="cpu",
-        )
-        if ckpt_best_val is not None:
-            best_val_loss = np.array(ckpt_best_val)
-        print(f"Loaded checkpoint: {load_path}; next epoch={start_epoch}")
+    if phase in {"retrain", "eval"}:
+        base_path = config["General"]["weights_path"]
+        last_path = make_ckpt_path(base_path, "last")
+        best_path = make_ckpt_path(base_path, "best")
+        load_path = last_path if os.path.exists(last_path) else best_path
+        if os.path.exists(load_path):
+            model, optimizer, start_epoch, ckpt_best_val = load_checkpoint(
+                model,
+                optimizer,
+                load_path,
+                map_location="cpu",
+            )
+            if ckpt_best_val is not None:
+                best_val_loss = np.array(ckpt_best_val)
+            print(f"Loaded checkpoint: {load_path}; next epoch={start_epoch}")
+        else:
+            print("No checkpoint found. Starting from scratch.")
         scheduler = set_scheduler(optimizer, current_config)
-    elif force_restart:
-        print("FORCE_RESTART=1, ignoring existing checkpoints and starting from scratch.")
-    else:
-        print("No checkpoint found. Starting from scratch.")
 
     if phase != "eval":
         model, best_val_loss = training_loop(

@@ -29,4 +29,8 @@ bin/
 *.jsonl
 *.csv
 *.yaml
+*.log
+*.pid
+*.out
+
 

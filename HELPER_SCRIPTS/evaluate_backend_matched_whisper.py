@@ -50,6 +50,13 @@ def is_pred_layer(path: Path, layer: int) -> bool:
     return False
 
 
+def valid_len(path: Path, max_t: int = 3000) -> int:
+    match = LEN_RE.search(path.name)
+    if not match:
+        return max_t
+    return max(1, min(int(match.group(1)), max_t))
+
+
 def index_features(root: Path, pred_layer: Optional[int] = None) -> Dict[str, Path]:
     index: Dict[str, Path] = {}
     npy_paths = sorted(root.rglob("*.npy"))
@@ -108,6 +115,8 @@ class BackendMatchedDataset(Dataset):
         channel: str,
         pred_layer: int,
         limit: Optional[int],
+        pred_tail: str,
+        max_t: int,
     ):
         clean_idx = index_features(clean_root)
         reverb_idx = index_features(reverb_root)
@@ -126,6 +135,8 @@ class BackendMatchedDataset(Dataset):
 
         self.items: List[Tuple[str, Path, Path, Path, str]] = []
         self.tokenizer = tokenizer
+        self.pred_tail = pred_tail
+        self.max_t = max_t
         for uid in common:
             text = clean_text(text_idx[uid].read_text(encoding="utf-8").strip())
             self.items.append((uid, clean_idx[uid], reverb_idx[uid], pred_idx[uid], text))
@@ -136,11 +147,27 @@ class BackendMatchedDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, object]:
         uid, clean_path, reverb_path, pred_path, text = self.items[idx]
+        clean = load_features(clean_path)
+        reverb = load_features(reverb_path)
+        pred = load_features(pred_path)
+
+        # Saved model predictions contain zeros after the real utterance because
+        # the model output is multiplied by the training mask. Whisper expects a
+        # valid padded/silent log-mel tail, not arbitrary zeros. For inference,
+        # using the reverb tail is allowed because it comes from the observed
+        # input audio, not from clean speech.
+        if self.pred_tail != "zero":
+            length = valid_len(pred_path, self.max_t)
+            source = {"reverb": reverb, "clean": clean}.get(self.pred_tail)
+            if source is None:
+                raise ValueError(f"Unknown pred_tail mode: {self.pred_tail}")
+            pred[:, length:] = source[:, length:]
+
         return {
             "uid": uid,
-            "clean": torch.from_numpy(load_features(clean_path)),
-            "reverb": torch.from_numpy(load_features(reverb_path)),
-            "pred": torch.from_numpy(load_features(pred_path)),
+            "clean": torch.from_numpy(clean),
+            "reverb": torch.from_numpy(reverb),
+            "pred": torch.from_numpy(pred),
             "label_ids": torch.tensor(self.tokenizer(text).input_ids, dtype=torch.long),
         }
 
@@ -198,6 +225,7 @@ def main() -> None:
     parser.add_argument("--text-root", type=Path, default=Path("/storage/tal/thesis/DataBase_BIUREV/transcription_matched/val"))
     parser.add_argument("--channel", type=str, default="ch1")
     parser.add_argument("--pred-layer", type=int, default=0)
+    parser.add_argument("--pred-tail", choices=["zero", "reverb", "clean"], default="zero")
     parser.add_argument("--model-name", type=str, default="openai/whisper-small")
     parser.add_argument("--language", type=str, default="en")
     parser.add_argument("--task", type=str, default="transcribe")
@@ -210,7 +238,18 @@ def main() -> None:
 
     tokenizer = WhisperTokenizer.from_pretrained(args.model_name, language=args.language, task=args.task)
     processor = WhisperProcessor.from_pretrained(args.model_name, language=args.language, task=args.task)
-    dataset = BackendMatchedDataset(args.clean_root, args.reverb_root, args.pred_root, args.text_root, tokenizer, args.channel, args.pred_layer, args.limit)
+    dataset = BackendMatchedDataset(
+        args.clean_root,
+        args.reverb_root,
+        args.pred_root,
+        args.text_root,
+        tokenizer,
+        args.channel,
+        args.pred_layer,
+        args.limit,
+        args.pred_tail,
+        args.max_t,
+    )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=Collator(tokenizer, args.max_t))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

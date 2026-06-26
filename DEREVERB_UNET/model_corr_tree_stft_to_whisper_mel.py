@@ -40,7 +40,7 @@ def unet_upconv(nc, output_nc, kernel_size, use_drop=False, outermost=False):
     uprelu = nn.ReLU(True)
     upconv = nn.ConvTranspose2d(nc, output_nc, kernel_size, stride=2, padding=padding[kernel_size])
     if outermost:
-        return nn.Sequential(upconv, nn.Tanh())
+        return nn.Sequential(upconv)
     upnorm = nn.BatchNorm2d(output_nc)
     if use_drop:
         return nn.Sequential(upconv, upnorm, nn.Dropout(0.5), uprelu)
