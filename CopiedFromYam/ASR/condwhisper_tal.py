@@ -51,7 +51,12 @@ def create_manifest_rows(rows: List[Dict[str, str]], out_path: Path) -> None:
 
 
 class CPMelDataset(Dataset):
-    """Loads a mel input plus non-destructive CP uncertainty features."""
+    """Loads a mel input plus conditioning features.
+
+    conditioning_mode="cp" uses inference-available CP interval features.
+    conditioning_mode="pred_clean" is an oracle experiment that uses clean,
+    pred-clean, and abs(pred-clean) as the conditioner input.
+    """
 
     def __init__(
         self,
@@ -60,12 +65,16 @@ class CPMelDataset(Dataset):
         input_key: str = "pred",
         clean_targets: bool = True,
         log_cp: bool = True,
+        conditioning_mode: str = "cp",
     ):
         self.rows = [json.loads(l) for l in Path(manifest).read_text(encoding="utf-8").splitlines() if l.strip()]
         self.tok = tokenizer
         self.input_key = input_key
         self.clean_targets = clean_targets
         self.log_cp = log_cp
+        self.conditioning_mode = conditioning_mode
+        if conditioning_mode not in {"cp", "pred_clean"}:
+            raise ValueError(f"Unsupported conditioning_mode: {conditioning_mode}")
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -77,14 +86,27 @@ class CPMelDataset(Dataset):
         pred = np.load(r[self.input_key]).astype(np.float32)[:, :true_T]
         lower = np.load(r["lower"]).astype(np.float32)[:, :true_T]
         upper = np.load(r["upper"]).astype(np.float32)[:, :true_T]
-        width = np.abs(upper - lower).astype(np.float32)
-        log_width = np.log1p(width).astype(np.float32) if self.log_cp else width
-        lower_delta = (pred - lower).astype(np.float32)
-        upper_delta = (upper - pred).astype(np.float32)
-        cp_features = np.concatenate(
-            [lower, upper, width, log_width, lower_delta, upper_delta],
-            axis=0,
-        ).astype(np.float32)
+
+        if self.conditioning_mode == "cp":
+            width = np.abs(upper - lower).astype(np.float32)
+            log_width = np.log1p(width).astype(np.float32) if self.log_cp else width
+            lower_delta = (pred - lower).astype(np.float32)
+            upper_delta = (upper - pred).astype(np.float32)
+            cond_features = np.concatenate(
+                [lower, upper, width, log_width, lower_delta, upper_delta],
+                axis=0,
+            ).astype(np.float32)
+        else:
+            clean = np.load(r["clean"]).astype(np.float32)[:, :true_T]
+            T = min(pred.shape[1], clean.shape[1])
+            pred = pred[:, :T]
+            clean = clean[:, :T]
+            signed_error = (pred - clean).astype(np.float32)
+            abs_error = np.abs(signed_error).astype(np.float32)
+            cond_features = np.concatenate(
+                [clean, signed_error, abs_error],
+                axis=0,
+            ).astype(np.float32)
 
         with open(r["text"], "r", encoding="utf-8") as f:
             text = f.read().strip()
@@ -93,8 +115,8 @@ class CPMelDataset(Dataset):
         label_ids = self.tok(target_text).input_ids
         return {
             "pred": torch.from_numpy(pred),
-            "cp_features": torch.from_numpy(cp_features),
-            "length": torch.tensor(true_T, dtype=torch.long),
+            "cp_features": torch.from_numpy(cond_features),
+            "length": torch.tensor(pred.shape[1], dtype=torch.long),
             "label_ids": torch.tensor(label_ids, dtype=torch.long),
             "text": text,
             "target_text": target_text,
@@ -158,8 +180,26 @@ def zero_uncertainty_features(pred: torch.Tensor) -> torch.Tensor:
     return torch.cat([pred, pred, zeros, zeros, zeros, zeros], dim=1)
 
 
+def zero_conditioning_features(pred: torch.Tensor, cond_feature_groups: int) -> torch.Tensor:
+    return torch.zeros(
+        pred.shape[0],
+        pred.shape[1] * cond_feature_groups,
+        pred.shape[2],
+        dtype=pred.dtype,
+        device=pred.device,
+    )
+
+
 @torch.no_grad()
-def evaluate_model(model, dataloader, processor, tokenizer, device, cp_mode: str = "true") -> Tuple[float, float, List[str], List[str]]:
+def evaluate_model(
+    model,
+    dataloader,
+    processor,
+    tokenizer,
+    device,
+    cp_mode: str = "true",
+    cond_feature_groups: int = 6,
+) -> Tuple[float, float, List[str], List[str]]:
     model.eval()
     total_loss = 0.0
     preds: List[str] = []
@@ -171,7 +211,10 @@ def evaluate_model(model, dataloader, processor, tokenizer, device, cp_mode: str
         input_lengths = batch["lengths"].to(device).long()
 
         if cp_mode == "zero":
-            cp_features = zero_uncertainty_features(pred)
+            if cond_feature_groups == 6:
+                cp_features = zero_uncertainty_features(pred)
+            else:
+                cp_features = zero_conditioning_features(pred, cond_feature_groups)
         elif cp_mode == "shuffled":
             perm = torch.randperm(cp_features.shape[0], device=cp_features.device)
             cp_features = cp_features[perm]
@@ -251,6 +294,27 @@ def print_grad_debug(model) -> None:
         if p.requires_grad:
             grad = None if p.grad is None else float(p.grad.detach().abs().mean().item())
             print(f"  {name}: {grad}")
+
+
+def condition_only_parameters(model):
+    """Train only paths that require the external condition.
+
+    The frozen Whisper encoder already supplies the pred representation. For
+    the oracle experiment we want to test whether clean-pred information helps,
+    not whether a large unconditional latent adapter can fit the training set.
+    """
+    for p in model.latent_blocks.parameters():
+        p.requires_grad = False
+
+    params = list(model.conditioner.parameters())
+    for block in model.latent_blocks:
+        for module in (block.global_to_cond, block.film_gamma, block.film_beta, block.cond_delta):
+            for p in module.parameters():
+                p.requires_grad = True
+                params.append(p)
+        block.cond_gate.requires_grad = True
+        params.append(block.cond_gate)
+    return params
 
 
 def train_one_epoch(
@@ -370,8 +434,14 @@ if __name__ == "__main__":
     batch_size = 8
     n_epochs = 20
     patience = 6
-    lambda_delta = 0.01
     run_cp_ablations_every_epoch = True
+    conditioning_mode = "pred_clean"
+    cond_feature_groups = 3 if conditioning_mode == "pred_clean" else 6
+    # The Whisper encoder/decoder are frozen, so the conditioning stack must
+    # stay close to the vanilla encoder manifold. Without this penalty the
+    # latent adapters can destroy generation after a single epoch, even when
+    # the conditioning features are zeroed/shuffled.
+    lambda_delta = 0.01
 
     create_manifests_if_missing(
         splits_to_use=splits_to_use,
@@ -390,11 +460,11 @@ if __name__ == "__main__":
     processor = WhisperProcessor.from_pretrained(model_name, language=language, task=task)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_ds = CPMelDataset(manifest_dir / f"train_{manifest_name}", tokenizer)
-    val_ds = CPMelDataset(manifest_dir / f"val_{manifest_name}", tokenizer)
-    val_clean_ds = CPMelDataset(manifest_dir / f"val_{manifest_name}", tokenizer, input_key="clean")
-    val_reverb_ds = CPMelDataset(manifest_dir / f"val_{manifest_name}", tokenizer, input_key="reverb")
-    test_ds = CPMelDataset(manifest_dir / f"test_{manifest_name}", tokenizer)
+    train_ds = CPMelDataset(manifest_dir / f"train_{manifest_name}", tokenizer, conditioning_mode=conditioning_mode)
+    val_ds = CPMelDataset(manifest_dir / f"val_{manifest_name}", tokenizer, conditioning_mode=conditioning_mode)
+    val_clean_ds = CPMelDataset(manifest_dir / f"val_{manifest_name}", tokenizer, input_key="clean", conditioning_mode=conditioning_mode)
+    val_reverb_ds = CPMelDataset(manifest_dir / f"val_{manifest_name}", tokenizer, input_key="reverb", conditioning_mode=conditioning_mode)
+    test_ds = CPMelDataset(manifest_dir / f"test_{manifest_name}", tokenizer, conditioning_mode=conditioning_mode)
     collator = CPMelCollator(tokenizer)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collator)
@@ -407,7 +477,8 @@ if __name__ == "__main__":
         model_name=model_name,
         mel_bins=80,
         d_cond=128,
-        cond_feature_groups=6,
+        cond_feature_groups=cond_feature_groups,
+        include_pred_in_conditioner=(conditioning_mode == "cp"),
         num_latent_blocks=4,
         num_heads=8,
         freeze_whisper=True,
@@ -417,57 +488,34 @@ if __name__ == "__main__":
     model.base.config.forced_decoder_ids = forced_decoder_ids
     model.base.generation_config.forced_decoder_ids = forced_decoder_ids
 
+    train_params = condition_only_parameters(model) if conditioning_mode == "pred_clean" else list(model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print("Using fixed latent Condformer-style CP conditioning")
+    print(f"Using fixed latent Condformer-style conditioning_mode={conditioning_mode}")
     print(f"Trainable params: {trainable}/{total}")
 
-    vanilla_val_loss, vanilla_val_wer = evaluate_vanilla_on_pred(
-        val_loader, processor, tokenizer, device, model_name, language, task
+    init_val_loss, init_val_wer, _, _ = evaluate_model(
+        model, val_loader, processor, tokenizer, device, cp_mode="true", cond_feature_groups=cond_feature_groups
     )
-    print({
-        "baseline": "vanilla_pred_only_val",
-        "val_loss": vanilla_val_loss,
-        "val_wer": f"{vanilla_val_wer:.3%}",
-    })
-
-    vanilla_clean_val_loss, vanilla_clean_val_wer = evaluate_vanilla_on_pred(
-        val_clean_loader, processor, tokenizer, device, model_name, language, task
+    init_zero_val_loss, init_zero_val_wer, _, _ = evaluate_model(
+        model, val_loader, processor, tokenizer, device, cp_mode="zero", cond_feature_groups=cond_feature_groups
     )
-    print({
-        "baseline": "vanilla_clean_val",
-        "val_loss": vanilla_clean_val_loss,
-        "val_wer": f"{vanilla_clean_val_wer:.3%}",
-    })
-
-    vanilla_reverb_val_loss, vanilla_reverb_val_wer = evaluate_vanilla_on_pred(
-        val_reverb_loader, processor, tokenizer, device, model_name, language, task
+    _, init_shuf_wer, _, _ = evaluate_model(
+        model, val_loader, processor, tokenizer, device, cp_mode="shuffled", cond_feature_groups=cond_feature_groups
     )
-    print({
-        "baseline": "vanilla_reverb_val",
-        "val_loss": vanilla_reverb_val_loss,
-        "val_wer": f"{vanilla_reverb_val_wer:.3%}",
-    })
-
-    init_val_loss, init_val_wer, _, _ = evaluate_model(model, val_loader, processor, tokenizer, device, cp_mode="true")
-    init_zero_val_loss, init_zero_val_wer, _, _ = evaluate_model(model, val_loader, processor, tokenizer, device, cp_mode="zero")
-    _, init_shuf_wer, _, _ = evaluate_model(model, val_loader, processor, tokenizer, device, cp_mode="shuffled")
     print({
         "train_loss": None,
         "val_loss": init_val_loss,
         "val_wer": f"{init_val_wer:.3%}",
-        "val_zero_cp_loss": init_zero_val_loss,
-        "val_zero_cp_wer": f"{init_zero_val_wer:.3%}",
-        "val_shuffled_cp_wer": f"{init_shuf_wer:.3%}",
+        "val_zero_cond_loss": init_zero_val_loss,
+        "val_zero_cond_wer": f"{init_zero_val_wer:.3%}",
+        "val_shuffled_cond_wer": f"{init_shuf_wer:.3%}",
         "epoch": 0,
     })
 
     optimizer = torch.optim.AdamW(
-        [
-            {"params": model.conditioner.parameters(), "lr": 1e-4},
-            {"params": model.latent_blocks.parameters(), "lr": 5e-5},
-        ],
-        weight_decay=0.01,
+        [{"params": train_params, "lr": 1e-4 if conditioning_mode == "pred_clean" else 3e-5}],
+        weight_decay=0.0,
     )
     total_steps = n_epochs * max(len(train_loader), 1)
     scheduler = get_linear_schedule_with_warmup(
@@ -478,7 +526,7 @@ if __name__ == "__main__":
 
     best_val_wer = init_val_wer
     epochs_without_improve = 0
-    best_path = Path("/storage/tal/thesis/weights/condwhisper_cpwidth_fixed_best.pt")
+    best_path = Path(f"/storage/tal/thesis/weights/condwhisper_{conditioning_mode}_fixed_best.pt")
     best_path.parent.mkdir(parents=True, exist_ok=True)
 
     torch.save({"model": model.state_dict(), "val_wer": best_val_wer, "epoch": 0}, best_path)
@@ -495,7 +543,9 @@ if __name__ == "__main__":
             lambda_delta=lambda_delta,
             debug_first_batch=(epoch == 0),
         )
-        val_loss, val_wer, _, _ = evaluate_model(model, val_loader, processor, tokenizer, device, cp_mode="true")
+        val_loss, val_wer, _, _ = evaluate_model(
+            model, val_loader, processor, tokenizer, device, cp_mode="true", cond_feature_groups=cond_feature_groups
+        )
 
         row = {
             "train_loss": train_loss,
@@ -505,10 +555,14 @@ if __name__ == "__main__":
         }
 
         if run_cp_ablations_every_epoch:
-            _, val_zero_wer, _, _ = evaluate_model(model, val_loader, processor, tokenizer, device, cp_mode="zero")
-            _, val_shuf_wer, _, _ = evaluate_model(model, val_loader, processor, tokenizer, device, cp_mode="shuffled")
-            row["val_zero_cp_wer"] = f"{val_zero_wer:.3%}"
-            row["val_shuffled_cp_wer"] = f"{val_shuf_wer:.3%}"
+            _, val_zero_wer, _, _ = evaluate_model(
+                model, val_loader, processor, tokenizer, device, cp_mode="zero", cond_feature_groups=cond_feature_groups
+            )
+            _, val_shuf_wer, _, _ = evaluate_model(
+                model, val_loader, processor, tokenizer, device, cp_mode="shuffled", cond_feature_groups=cond_feature_groups
+            )
+            row["val_zero_cond_wer"] = f"{val_zero_wer:.3%}"
+            row["val_shuffled_cond_wer"] = f"{val_shuf_wer:.3%}"
 
         print(row)
 
@@ -528,16 +582,22 @@ if __name__ == "__main__":
         model.load_state_dict(ckpt["model"], strict=False)
         print(f"[LOAD] Loaded best checkpoint from {best_path} (val_wer={ckpt['val_wer']:.3%})")
 
-    test_loss, test_wer, _, _ = evaluate_model(model, test_loader, processor, tokenizer, device, cp_mode="true")
-    zero_test_loss, zero_test_wer, _, _ = evaluate_model(model, test_loader, processor, tokenizer, device, cp_mode="zero")
-    shuf_test_loss, shuf_test_wer, _, _ = evaluate_model(model, test_loader, processor, tokenizer, device, cp_mode="shuffled")
+    test_loss, test_wer, _, _ = evaluate_model(
+        model, test_loader, processor, tokenizer, device, cp_mode="true", cond_feature_groups=cond_feature_groups
+    )
+    zero_test_loss, zero_test_wer, _, _ = evaluate_model(
+        model, test_loader, processor, tokenizer, device, cp_mode="zero", cond_feature_groups=cond_feature_groups
+    )
+    shuf_test_loss, shuf_test_wer, _, _ = evaluate_model(
+        model, test_loader, processor, tokenizer, device, cp_mode="shuffled", cond_feature_groups=cond_feature_groups
+    )
     print({
         "test_loss": test_loss,
         "test_wer": f"{test_wer:.3%}",
-        "test_zero_cp_loss": zero_test_loss,
-        "test_zero_cp_wer": f"{zero_test_wer:.3%}",
-        "test_shuffled_cp_loss": shuf_test_loss,
-        "test_shuffled_cp_wer": f"{shuf_test_wer:.3%}",
+        "test_zero_cond_loss": zero_test_loss,
+        "test_zero_cond_wer": f"{zero_test_wer:.3%}",
+        "test_shuffled_cond_loss": shuf_test_loss,
+        "test_shuffled_cond_wer": f"{shuf_test_wer:.3%}",
     })
 
     vanilla_test_loss, vanilla_test_wer = evaluate_vanilla_on_pred(

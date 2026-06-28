@@ -34,19 +34,26 @@ class CPConditioner(nn.Module):
     global uncertainty scale. This version keeps raw and log-scaled information.
     """
 
-    def __init__(self, mel_bins: int = 80, d_cond: int = 128, cond_feature_groups: int = 6):
+    def __init__(
+        self,
+        mel_bins: int = 80,
+        d_cond: int = 128,
+        cond_feature_groups: int = 6,
+        include_pred: bool = True,
+    ):
         super().__init__()
-        in_ch = mel_bins * (1 + cond_feature_groups)  # pred + uncertainty feature groups
+        self.include_pred = include_pred
+        in_ch = mel_bins * (cond_feature_groups + (1 if include_pred else 0))
         self.local_net = nn.Sequential(
-            nn.Conv1d(in_ch, 192, kernel_size=7, padding=3),
+            nn.Conv1d(in_ch, 192, kernel_size=7, padding=3, bias=False),
             nn.GELU(),
-            nn.Conv1d(192, d_cond, kernel_size=7, padding=3),
+            nn.Conv1d(192, d_cond, kernel_size=7, padding=3, bias=False),
             nn.GELU(),
         )
         self.global_net = nn.Sequential(
-            nn.Linear(d_cond, d_cond),
+            nn.Linear(d_cond, d_cond, bias=False),
             nn.GELU(),
-            nn.Linear(d_cond, d_cond),
+            nn.Linear(d_cond, d_cond, bias=False),
         )
 
     def forward(
@@ -56,7 +63,7 @@ class CPConditioner(nn.Module):
         input_lengths: torch.Tensor,
         target_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = torch.cat([pred, cp_features], dim=1)
+        x = torch.cat([pred, cp_features], dim=1) if self.include_pred else cp_features
         local = self.local_net(x)  # [B, d_cond, T]
         local_ds = F.adaptive_avg_pool1d(local, target_seq_len).transpose(1, 2)  # [B, S, d_cond]
 
@@ -95,9 +102,16 @@ class LatentCondSABlock(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
 
-        self.global_to_cond = nn.Linear(d_cond, d_cond)
+        self.global_to_cond = nn.Linear(d_cond, d_cond, bias=False)
         self.q_lfm = nn.Linear(d_model + d_cond, d_model)
         self.k_lfm = nn.Linear(d_model + d_cond, d_model)
+        self.film_gamma = nn.Linear(d_cond, d_model, bias=False)
+        self.film_beta = nn.Linear(d_cond, d_model, bias=False)
+        self.cond_delta = nn.Sequential(
+            nn.Linear(d_cond, d_model, bias=False),
+            nn.GELU(),
+            nn.Linear(d_model, d_model, bias=False),
+        )
 
         hidden_dim = int(d_model * mlp_ratio)
         self.ffn = nn.Sequential(
@@ -111,6 +125,9 @@ class LatentCondSABlock(nn.Module):
         nn.init.zeros_(self.q_lfm.bias)
         nn.init.normal_(self.k_lfm.weight, mean=0.0, std=1e-4)
         nn.init.zeros_(self.k_lfm.bias)
+        nn.init.normal_(self.film_gamma.weight, mean=0.0, std=1e-3)
+        nn.init.normal_(self.film_beta.weight, mean=0.0, std=1e-3)
+        nn.init.normal_(self.cond_delta[-1].weight, mean=0.0, std=1e-3)
         nn.init.normal_(self.out_proj.weight, mean=0.0, std=1e-4)
         nn.init.zeros_(self.out_proj.bias)
         nn.init.normal_(self.ffn[-1].weight, mean=0.0, std=1e-4)
@@ -118,6 +135,7 @@ class LatentCondSABlock(nn.Module):
 
         self.attn_gate = nn.Parameter(torch.tensor(0.01))
         self.ffn_gate = nn.Parameter(torch.tensor(0.01))
+        self.cond_gate = nn.Parameter(torch.tensor(0.05))
 
     def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
@@ -132,11 +150,15 @@ class LatentCondSABlock(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = self.norm1(hidden_states)
+        cond = cond_local + self.global_to_cond(cond_global)[:, None, :]
+        gamma = 0.10 * torch.tanh(self.film_gamma(cond))
+        beta = 0.10 * torch.tanh(self.film_beta(cond))
+        x = x * (1.0 + gamma) + beta
+
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        cond = cond_local + self.global_to_cond(cond_global)[:, None, :]
         q = q + self.q_lfm(torch.cat([q, cond], dim=-1))
         k = k + self.k_lfm(torch.cat([k, cond], dim=-1))
 
@@ -155,6 +177,8 @@ class LatentCondSABlock(nn.Module):
         out = self.out_proj(out)
 
         hidden_states = hidden_states + torch.tanh(self.attn_gate) * out
+        cond_residual = self.cond_delta(cond)
+        hidden_states = hidden_states + torch.tanh(self.cond_gate) * cond_residual
         ff = self.ffn(self.norm2(hidden_states))
         hidden_states = hidden_states + torch.tanh(self.ffn_gate) * ff
 
@@ -179,6 +203,7 @@ class CPCondWhisperModel(nn.Module):
         mel_bins: int = 80,
         d_cond: int = 128,
         cond_feature_groups: int = 6,
+        include_pred_in_conditioner: bool = True,
         num_latent_blocks: int = 4,
         num_heads: int = 8,
         freeze_whisper: bool = True,
@@ -194,6 +219,7 @@ class CPCondWhisperModel(nn.Module):
             mel_bins=mel_bins,
             d_cond=d_cond,
             cond_feature_groups=cond_feature_groups,
+            include_pred=include_pred_in_conditioner,
         )
         self.latent_blocks = nn.ModuleList(
             [LatentCondSABlock(d_model=d_model, d_cond=d_cond, num_heads=num_heads) for _ in range(num_latent_blocks)]

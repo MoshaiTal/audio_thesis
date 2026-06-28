@@ -73,12 +73,14 @@ class CondWhisperVNextDataset(Dataset):
         lower, lower_T = self._load(row["lower"])
         upper, upper_T = self._load(row["upper"])
         clean, clean_T = self._load(row["clean"])
+        reverb, reverb_T = self._load(row["reverb"]) if "reverb" in row else (pred.clone(), pred_T)
 
-        T = min(pred_T, lower_T, upper_T, clean_T)
+        T = min(pred_T, lower_T, upper_T, clean_T, reverb_T)
         pred = pred[:, :T]
         lower = lower[:, :T]
         upper = upper[:, :T]
         clean = clean[:, :T]
+        reverb = reverb[:, :T]
         width = torch.abs(upper - lower)
 
         text_path = Path(row["text"])
@@ -93,6 +95,7 @@ class CondWhisperVNextDataset(Dataset):
             "upper": upper,
             "width": width,
             "clean": clean,
+            "reverb": reverb,
             "length": T,
             "label_ids": torch.tensor(label_ids, dtype=torch.long),
         }
@@ -114,6 +117,7 @@ class CondWhisperVNextCollator:
         upper = torch.stack([self._pad_mel(item["upper"]) for item in batch])
         width = torch.stack([self._pad_mel(item["width"]) for item in batch])
         clean = torch.stack([self._pad_mel(item["clean"]) for item in batch])
+        reverb = torch.stack([self._pad_mel(item["reverb"]) for item in batch])
 
         label_ids = [item["label_ids"] for item in batch]
         labels_text_ids = pad_sequence(label_ids, batch_first=True, padding_value=self.pad_token_id)
@@ -129,6 +133,7 @@ class CondWhisperVNextCollator:
             "upper": upper,
             "width": width,
             "clean": clean,
+            "reverb": reverb,
             "lengths": torch.tensor([min(item["length"], self.max_T) for item in batch], dtype=torch.long),
             "labels": labels,
             "labels_text_ids": labels_text_ids,
@@ -155,6 +160,20 @@ def count_trainable_parameters(model: nn.Module) -> Dict[str, int]:
         if p.requires_grad:
             total += p.numel()
     return {"total": total}
+
+
+def print_compact_epoch(row: Dict) -> None:
+    summary = {
+        "epoch": row["epoch"],
+        "val_wer": f"{100.0 * row['val_wer']:.3f}%",
+        "delta_vs_pred": f"{100.0 * row['delta_vs_pred_baseline_wer']:+.3f}pp",
+        "val_loss": round(row["val_loss"], 4),
+        "train_asr_loss": round(row["train_asr_loss"], 4),
+        "train_total_loss": round(row["train_total_loss"], 4),
+    }
+    if row.get("last_debug") and row["last_debug"].get("mean_layer_update_abs") is not None:
+        summary["update_abs"] = round(float(row["last_debug"]["mean_layer_update_abs"]), 5)
+    print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
 def freeze_all(model: nn.Module) -> None:
@@ -270,9 +289,13 @@ class CPFiLMAdapter(nn.Module):
         bottleneck: int = 128,
         film_scale: float = 0.25,
         init_residual_scale: float = 0.002,
+        adapter_mode: str = "residual_film",
     ):
         super().__init__()
+        if adapter_mode not in {"residual_film", "direct_film"}:
+            raise ValueError(f"Unsupported adapter_mode: {adapter_mode}")
         self.film_scale = film_scale
+        self.adapter_mode = adapter_mode
         self.norm = nn.LayerNorm(d_model)
         self.gamma_net = nn.Sequential(
             nn.Linear(d_model, bottleneck),
@@ -299,8 +322,26 @@ class CPFiLMAdapter(nn.Module):
         z = self.norm(x)
         gamma = self.film_scale * torch.tanh(self.gamma_net(cond))
         beta = self.film_scale * torch.tanh(self.beta_net(cond))
+        if self.adapter_mode == "direct_film":
+            x_new = x * (1.0 + gamma) + beta
+            debug = {
+                "residual_scale": torch.tensor(1.0, device=x.device, dtype=x.dtype),
+                "gamma_abs": gamma.abs().mean(),
+                "beta_abs": beta.abs().mean(),
+                "delta_abs": (x_new - x).abs().mean(),
+                "film_delta_abs": (x_new - x).abs().mean(),
+                "mlp_delta_abs": torch.tensor(0.0, device=x.device, dtype=x.dtype),
+                "layer_update_abs": (x_new - x).abs().mean(),
+            }
+            return x_new, debug
+
         z_film = z * (1.0 + gamma) + beta
-        delta = torch.tanh(self.delta_net(z_film))
+        # Use the FiLM transform itself as the main residual direction. The
+        # MLP adds a small nonlinear correction, but FiLM should not be hidden
+        # behind the adapter MLP or its gradients become indirect.
+        film_delta = z_film - z
+        mlp_delta = torch.tanh(self.delta_net(z_film))
+        delta = film_delta + 0.25 * mlp_delta
         residual_scale = F.softplus(self.log_residual_scale)
         x_new = x + residual_scale * delta
         debug = {
@@ -308,6 +349,8 @@ class CPFiLMAdapter(nn.Module):
             "gamma_abs": gamma.abs().mean(),
             "beta_abs": beta.abs().mean(),
             "delta_abs": delta.abs().mean(),
+            "film_delta_abs": film_delta.abs().mean(),
+            "mlp_delta_abs": mlp_delta.abs().mean(),
             "layer_update_abs": (x_new - x).abs().mean(),
         }
         return x_new, debug
@@ -323,6 +366,7 @@ class CondWhisperVNext(nn.Module):
         adapter_bottleneck: int = 128,
         adapter_film_scale: float = 0.25,
         init_residual_scale: float = 0.002,
+        adapter_mode: str = "residual_film",
     ):
         super().__init__()
         self.student = whisper_student
@@ -343,6 +387,7 @@ class CondWhisperVNext(nn.Module):
                 bottleneck=adapter_bottleneck,
                 film_scale=adapter_film_scale,
                 init_residual_scale=init_residual_scale,
+                adapter_mode=adapter_mode,
             )
             for i in self.selected_layers
         })
@@ -442,7 +487,7 @@ def masked_kl(student_logits, teacher_logits, mask, temperature: float = 1.0):
 def masked_hidden_mse(student_h, teacher_h, lengths_enc):
     mask = make_time_mask(lengths_enc, student_h.shape[1]).float()[:, :, None]
     diff = ((student_h - teacher_h) ** 2) * mask
-    denom = mask.sum().clamp(min=1.0)
+    denom = (mask.sum() * student_h.shape[-1]).clamp(min=1.0)
     return diff.sum() / denom
 
 
@@ -736,6 +781,7 @@ def main():
     parser.add_argument("--adapter-bottleneck", type=int, default=128)
     parser.add_argument("--adapter-film-scale", type=float, default=0.25)
     parser.add_argument("--init-residual-scale", type=float, default=0.002)
+    parser.add_argument("--adapter-mode", choices=["residual_film", "direct_film"], default="residual_film")
     parser.add_argument("--lambda-hidden-kd", type=float, default=0.50)
     parser.add_argument("--lambda-logit-kd", type=float, default=0.20)
     parser.add_argument("--lambda-adapter-update", type=float, default=0.02)
@@ -782,6 +828,7 @@ def main():
         adapter_bottleneck=args.adapter_bottleneck,
         adapter_film_scale=args.adapter_film_scale,
         init_residual_scale=args.init_residual_scale,
+        adapter_mode=args.adapter_mode,
     ).to(device)
 
     trainable = count_trainable_parameters(model)
@@ -801,6 +848,7 @@ def main():
         "condwhisper_vnext_init_val": init_val,
         "trainable_params": trainable,
         "selected_layers": selected_layers,
+        "adapter_mode": args.adapter_mode,
     }
     (out_dir / "initial_summary.json").write_text(json.dumps(initial_summary, indent=2), encoding="utf-8")
 
@@ -838,7 +886,7 @@ def main():
             "last_debug": train_metrics["last_debug"],
         }
         history.append(row)
-        print(json.dumps(row, ensure_ascii=False, separators=(",", ":")), flush=True)
+        print_compact_epoch(row)
         (out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
 
         candidate = {"wer": val_metrics["wer"], "cer": val_metrics["cer"], "loss": val_metrics["loss"]}
