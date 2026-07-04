@@ -218,10 +218,10 @@ class PredReverbAFiLMWhisper(nn.Module):
             "cond_global_abs": cond_global.abs().mean(),
         }
 
-    def forward(self, pred, clean, lengths, labels, decoder_attention_mask):
+    def forward(self, pred, clean, lengths, labels, decoder_attention_mask, output_hidden_states: bool = True):
         from transformers.models.whisper.modeling_whisper import shift_tokens_right
 
-        enc = self.encode_student(pred, clean, lengths, output_hidden_states=True)
+        enc = self.encode_student(pred, clean, lengths, output_hidden_states=output_hidden_states)
         out = self.student(
             encoder_outputs=enc["encoder_outputs"],
             labels=labels,

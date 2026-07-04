@@ -51,6 +51,10 @@ def print_compact_epoch(row: Dict) -> None:
         "train_asr_loss": round(row["train_asr_loss"], 4),
         "train_total_loss": round(row["train_total_loss"], 4),
     }
+    if "train_condition_contrast_loss" in row:
+        summary["contrast_loss"] = round(row["train_condition_contrast_loss"], 4)
+    if "train_true_minus_shuffled_asr_loss" in row:
+        summary["true-shuf-ce"] = round(row["train_true_minus_shuffled_asr_loss"], 4)
     if "true_minus_zero_wer" in row:
         summary["true-zero"] = f"{100.0 * row['true_minus_zero_wer']:+.3f}pp"
         summary["true-shuffled"] = f"{100.0 * row['true_minus_shuffled_wer']:+.3f}pp"
@@ -231,8 +235,8 @@ class OraclePredCleanFiLMWhisper(nn.Module):
             "cond_global_abs": cond_global.abs().mean(),
         }
 
-    def forward(self, pred, clean, lengths, labels, decoder_attention_mask):
-        enc = self.encode_student(pred, clean, lengths, output_hidden_states=True)
+    def forward(self, pred, clean, lengths, labels, decoder_attention_mask, output_hidden_states: bool = True):
+        enc = self.encode_student(pred, clean, lengths, output_hidden_states=output_hidden_states)
         out = self.student(
             encoder_outputs=enc["encoder_outputs"],
             labels=labels,
@@ -366,10 +370,15 @@ def train_one_epoch_oracle(
     lambda_adapter_update,
     show_progress: bool,
     condition_source: str = "clean",
+    lambda_condition_contrast: float = 0.0,
+    condition_contrast_margin: float = 0.02,
 ):
     model.train()
     teacher.eval()
-    total_loss = asr_loss = hidden_kd_loss = logit_kd_loss = update_reg_loss = 0.0
+    total_loss = asr_loss = hidden_kd_loss = logit_kd_loss = update_reg_loss = contrast_loss_total = 0.0
+    true_asr_contrast_loss = 0.0
+    shuffled_asr_loss = 0.0
+    contrast_n = 0
     n = 0
     last_debug = None
     last_grad_norms = None
@@ -411,7 +420,33 @@ def train_one_epoch_oracle(
         else:
             update_reg = torch.tensor(0.0, device=device)
 
-        loss = student_out["loss"] + lambda_hidden_kd * hidden_kd + lambda_logit_kd * logit_kd + lambda_adapter_update * update_reg
+        contrast_loss = torch.tensor(0.0, device=device)
+        shuffled_loss = torch.tensor(0.0, device=device)
+        if lambda_condition_contrast > 0.0 and condition.shape[0] > 1:
+            perm = torch.randperm(condition.shape[0], device=condition.device)
+            if torch.equal(perm, torch.arange(condition.shape[0], device=condition.device)):
+                perm = torch.roll(perm, shifts=1)
+            shuffled_condition = condition[perm]
+            shuffled_out = model(
+                pred=pred,
+                clean=shuffled_condition,
+                lengths=lengths,
+                labels=labels,
+                decoder_attention_mask=decoder_attention_mask,
+                output_hidden_states=False,
+            )
+            shuffled_loss = shuffled_out["loss"]
+            contrast_loss = F.relu(student_out["loss"] - shuffled_loss + condition_contrast_margin)
+            true_asr_contrast_loss += float(student_out["loss"].detach().cpu().item())
+            contrast_n += 1
+
+        loss = (
+            student_out["loss"]
+            + lambda_hidden_kd * hidden_kd
+            + lambda_logit_kd * logit_kd
+            + lambda_adapter_update * update_reg
+            + lambda_condition_contrast * contrast_loss
+        )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -423,6 +458,8 @@ def train_one_epoch_oracle(
         hidden_kd_loss += float(hidden_kd.detach().cpu().item())
         logit_kd_loss += float(logit_kd.detach().cpu().item())
         update_reg_loss += float(update_reg.detach().cpu().item())
+        contrast_loss_total += float(contrast_loss.detach().cpu().item())
+        shuffled_asr_loss += float(shuffled_loss.detach().cpu().item()) if lambda_condition_contrast > 0.0 and condition.shape[0] > 1 else 0.0
         n += 1
 
         last_debug = {
@@ -448,6 +485,11 @@ def train_one_epoch_oracle(
         "train_hidden_kd_loss": hidden_kd_loss / max(n, 1),
         "train_logit_kd_loss": logit_kd_loss / max(n, 1),
         "train_update_reg": update_reg_loss / max(n, 1),
+        "train_condition_contrast_loss": contrast_loss_total / max(n, 1),
+        "train_shuffled_asr_loss": shuffled_asr_loss / max(contrast_n, 1),
+        "train_true_minus_shuffled_asr_loss": (
+            (true_asr_contrast_loss - shuffled_asr_loss) / max(contrast_n, 1) if contrast_n > 0 else 0.0
+        ),
         "last_grad_norms": last_grad_norms,
         "last_debug": last_debug,
     }

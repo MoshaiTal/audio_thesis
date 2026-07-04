@@ -146,6 +146,9 @@ def main():
     parser.add_argument("--lambda-hidden-kd", type=float, default=0.10)
     parser.add_argument("--lambda-logit-kd", type=float, default=0.20)
     parser.add_argument("--lambda-adapter-update", type=float, default=0.001)
+    parser.add_argument("--lambda-condition-contrast", type=float, default=0.0)
+    parser.add_argument("--condition-contrast-margin", type=float, default=0.02)
+    parser.add_argument("--condition-contrast-warmup-epochs", type=int, default=0)
     parser.add_argument("--eval-condition-ablations", action="store_true")
     parser.add_argument("--show-progress", action="store_true")
     args = parser.parse_args()
@@ -201,6 +204,9 @@ def main():
                 "experiment": "pred_reverb_local_mask_film",
                 "selected_layers": selected_layers,
                 "adapter_mode": args.adapter_mode,
+                "lambda_condition_contrast": args.lambda_condition_contrast,
+                "condition_contrast_margin": args.condition_contrast_margin,
+                "condition_contrast_warmup_epochs": args.condition_contrast_warmup_epochs,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -220,6 +226,9 @@ def main():
         "trainable_params": trainable,
         "selected_layers": selected_layers,
         "adapter_mode": args.adapter_mode,
+        "lambda_condition_contrast": args.lambda_condition_contrast,
+        "condition_contrast_margin": args.condition_contrast_margin,
+        "condition_contrast_warmup_epochs": args.condition_contrast_warmup_epochs,
     }
     (out_dir / "initial_summary.json").write_text(json.dumps(initial_summary, indent=2), encoding="utf-8")
 
@@ -229,6 +238,11 @@ def main():
     no_improve = 0
 
     for epoch in range(1, args.epochs + 1):
+        effective_lambda_condition_contrast = (
+            args.lambda_condition_contrast
+            if epoch > args.condition_contrast_warmup_epochs
+            else 0.0
+        )
         train_metrics = train_one_epoch_oracle(
             model=model,
             teacher=teacher_whisper,
@@ -241,6 +255,8 @@ def main():
             lambda_adapter_update=args.lambda_adapter_update,
             show_progress=args.show_progress,
             condition_source="reverb",
+            lambda_condition_contrast=effective_lambda_condition_contrast,
+            condition_contrast_margin=args.condition_contrast_margin,
         )
         val_metrics = evaluate_oracle_model(model, teacher_whisper, processor, tokenizer, val_dl, device, selected_layers, args.show_progress, condition_source="reverb")
 
@@ -281,6 +297,9 @@ def main():
             "lambda_hidden_kd": args.lambda_hidden_kd,
             "lambda_logit_kd": args.lambda_logit_kd,
             "lambda_adapter_update": args.lambda_adapter_update,
+            "lambda_condition_contrast": effective_lambda_condition_contrast,
+            "condition_contrast_margin": args.condition_contrast_margin,
+            "condition_contrast_warmup_epochs": args.condition_contrast_warmup_epochs,
             **{k: v for k, v in train_metrics.items() if k not in {"last_grad_norms", "last_debug"}},
             **{f"val_{k}": v for k, v in val_metrics.items()},
             "delta_vs_pred_baseline_wer": float(val_metrics["wer"] - baseline_pred_val["wer"]),
