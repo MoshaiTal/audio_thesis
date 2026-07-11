@@ -55,12 +55,44 @@ def print_compact_epoch(row: Dict) -> None:
         summary["contrast_loss"] = round(row["train_condition_contrast_loss"], 4)
     if "train_true_minus_shuffled_asr_loss" in row:
         summary["true-shuf-ce"] = round(row["train_true_minus_shuffled_asr_loss"], 4)
+    if "train_true_minus_zero_asr_loss" in row:
+        summary["true-zero-ce"] = round(row["train_true_minus_zero_asr_loss"], 4)
     if "true_minus_zero_wer" in row:
         summary["true-zero"] = f"{100.0 * row['true_minus_zero_wer']:+.3f}pp"
         summary["true-shuffled"] = f"{100.0 * row['true_minus_shuffled_wer']:+.3f}pp"
     if row.get("last_debug") and row["last_debug"].get("mean_layer_update_abs") is not None:
         summary["update_abs"] = round(float(row["last_debug"]["mean_layer_update_abs"]), 5)
     print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+@torch.no_grad()
+def evaluate_baseline_source(whisper, processor, tokenizer, dataloader, device, source_key: str, show_progress: bool):
+    whisper.eval()
+    refs, preds, losses = [], [], []
+    for batch in tqdm(dataloader, desc=f"Eval baseline {source_key}", disable=not show_progress):
+        labels = batch["labels"].to(device)
+        labels_text_ids = batch["labels_text_ids"].to(device)
+        decoder_attention_mask = batch["decoder_attention_mask"].to(device)
+        input_features = batch[source_key].to(device).float()
+        out = whisper(
+            input_features=input_features,
+            labels=labels,
+            decoder_attention_mask=decoder_attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
+        gen_ids = whisper.generate(
+            input_features=input_features,
+            num_beams=5,
+            early_stopping=True,
+            repetition_penalty=1.2,
+        )
+        pred_texts = processor.batch_decode(gen_ids, skip_special_tokens=True)
+        ref_texts = tokenizer.batch_decode(labels_text_ids, skip_special_tokens=True)
+        refs.extend([clean_text(x) for x in ref_texts])
+        preds.extend([clean_text(x) for x in pred_texts])
+        losses.append(float(out.loss.item()))
+    return {"loss": float(np.mean(losses)), "wer": float(wer(refs, preds)), "cer": float(cer(refs, preds))}
 
 
 class PredCleanConditioner(nn.Module):
@@ -71,10 +103,20 @@ class PredCleanConditioner(nn.Module):
     future model can try to predict this error map from CP/reverb cues.
     """
 
-    def __init__(self, n_mels: int, d_model: int, hidden: int = 128, out_scale: float = 0.20):
+    def __init__(
+        self,
+        n_mels: int,
+        d_model: int,
+        hidden: int = 128,
+        out_scale: float = 0.20,
+        conditioner_mode: str = "full",
+    ):
         super().__init__()
+        if conditioner_mode not in {"full", "local_error", "global_error"}:
+            raise ValueError(f"Unsupported conditioner_mode: {conditioner_mode}")
         self.out_scale = out_scale
-        in_ch = n_mels * 4  # pred, clean, signed error, absolute error
+        self.conditioner_mode = conditioner_mode
+        in_ch = n_mels * 2 if conditioner_mode == "local_error" else n_mels * 4
         self.local_net = nn.Sequential(
             nn.Conv1d(in_ch, hidden, kernel_size=9, padding=4),
             nn.GELU(),
@@ -152,11 +194,18 @@ class PredCleanConditioner(nn.Module):
     def forward(self, pred, clean, target_len, lengths):
         error = pred - clean
         abs_error = torch.abs(error)
-        x = torch.cat([pred, clean, error, abs_error], dim=1)
+        if self.conditioner_mode == "local_error":
+            x = torch.cat([error, abs_error], dim=1)
+        else:
+            x = torch.cat([pred, clean, error, abs_error], dim=1)
         local = self.local_net(x)
         if local.shape[-1] != target_len:
             local = F.interpolate(local, size=target_len, mode="linear", align_corners=False)
         glob = self.global_mlp(self._global_feats(pred, clean, error, abs_error, lengths))
+        if self.conditioner_mode == "local_error":
+            glob = torch.zeros_like(glob)
+        elif self.conditioner_mode == "global_error":
+            local = torch.zeros_like(local)
         return self.out_scale * torch.tanh(local), self.out_scale * torch.tanh(glob)
 
 
@@ -171,10 +220,15 @@ class OraclePredCleanFiLMWhisper(nn.Module):
         adapter_film_scale: float = 0.25,
         init_residual_scale: float = 0.002,
         adapter_mode: str = "residual_film",
+        conditioner_mode: str = "full",
+        injection_position: str = "after_layer",
     ):
         super().__init__()
+        if injection_position not in {"after_layer", "before_layer"}:
+            raise ValueError(f"Unsupported injection_position: {injection_position}")
         self.student = whisper_student
         self.selected_layers = sorted(selected_layers)
+        self.injection_position = injection_position
 
         d_model = whisper_student.model.config.d_model
         n_mels = whisper_student.model.config.num_mel_bins
@@ -183,6 +237,7 @@ class OraclePredCleanFiLMWhisper(nn.Module):
             d_model=d_model,
             hidden=conditioner_hidden,
             out_scale=conditioner_scale,
+            conditioner_mode=conditioner_mode,
         )
         self.adapters = nn.ModuleDict({
             str(i): CPFiLMAdapter(
@@ -210,8 +265,20 @@ class OraclePredCleanFiLMWhisper(nn.Module):
         adapter_debug = []
 
         for idx, layer in enumerate(enc.layers):
+            if idx in self.selected_layers and self.injection_position == "before_layer":
+                x, dbg = self.adapters[str(idx)](x, cond_local, cond_global)
+                adapter_debug.append(
+                    {
+                        "layer": idx,
+                        "residual_scale": dbg["residual_scale"],
+                        "gamma_abs": dbg["gamma_abs"],
+                        "beta_abs": dbg["beta_abs"],
+                        "delta_abs": dbg["delta_abs"],
+                        "layer_update_abs": dbg["layer_update_abs"],
+                    }
+                )
             x = layer(x, attention_mask=None, output_attentions=False)[0]
-            if idx in self.selected_layers:
+            if idx in self.selected_layers and self.injection_position == "after_layer":
                 x, dbg = self.adapters[str(idx)](x, cond_local, cond_global)
                 adapter_debug.append(
                     {
@@ -235,7 +302,16 @@ class OraclePredCleanFiLMWhisper(nn.Module):
             "cond_global_abs": cond_global.abs().mean(),
         }
 
-    def forward(self, pred, clean, lengths, labels, decoder_attention_mask, output_hidden_states: bool = True):
+    def forward(
+        self,
+        pred,
+        clean,
+        lengths,
+        labels,
+        decoder_attention_mask,
+        output_hidden_states: bool = True,
+        output_logits: bool = True,
+    ):
         enc = self.encode_student(pred, clean, lengths, output_hidden_states=output_hidden_states)
         out = self.student(
             encoder_outputs=enc["encoder_outputs"],
@@ -244,21 +320,24 @@ class OraclePredCleanFiLMWhisper(nn.Module):
             use_cache=False,
             return_dict=True,
         )
-        decoder_input_ids = shift_tokens_right(
-            labels,
-            self.student.config.pad_token_id,
-            self.student.config.decoder_start_token_id,
-        )
-        out_for_kd = self.student(
-            encoder_outputs=enc["encoder_outputs"],
-            decoder_input_ids=decoder_input_ids,
-            decoder_attention_mask=decoder_attention_mask,
-            use_cache=False,
-            return_dict=True,
-        )
+        logits = None
+        if output_logits:
+            decoder_input_ids = shift_tokens_right(
+                labels,
+                self.student.config.pad_token_id,
+                self.student.config.decoder_start_token_id,
+            )
+            out_for_kd = self.student(
+                encoder_outputs=enc["encoder_outputs"],
+                decoder_input_ids=decoder_input_ids,
+                decoder_attention_mask=decoder_attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
+            logits = out_for_kd.logits
         return {
             "loss": out.loss,
-            "logits": out_for_kd.logits,
+            "logits": logits,
             "hidden_states": enc["hidden_states"],
             "adapter_debug": enc["adapter_debug"],
             "cond_local_abs": enc["cond_local_abs"],
@@ -284,6 +363,9 @@ def evaluate_oracle_model(
     show_progress: bool,
     condition_mode: str = "true",
     condition_source: str = "clean",
+    input_source: str = "pred",
+    eval_num_beams: int = 5,
+    max_eval_batches: int = 0,
 ):
     model.eval()
     teacher.eval()
@@ -292,8 +374,10 @@ def evaluate_oracle_model(
     update_vals, cond_local_vals, cond_global_vals = [], [], []
 
     desc = f"Eval FiLM source={condition_source} mode={condition_mode}"
-    for batch in tqdm(dataloader, desc=desc, disable=not show_progress):
-        pred = batch["pred"].to(device).float()
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc=desc, disable=not show_progress)):
+        if max_eval_batches > 0 and batch_idx >= max_eval_batches:
+            break
+        input_mel = batch[input_source].to(device).float()
         clean = batch["clean"].to(device).float()
         condition = batch[condition_source].to(device).float()
         lengths = batch["lengths"].to(device)
@@ -304,13 +388,13 @@ def evaluate_oracle_model(
         if condition_mode == "true":
             clean_cond = condition
         elif condition_mode == "zero":
-            clean_cond = pred
+            clean_cond = input_mel
         elif condition_mode == "shuffled":
             clean_cond = condition[torch.randperm(condition.shape[0], device=condition.device)]
         else:
             raise ValueError(f"Unsupported condition_mode: {condition_mode}")
 
-        student_out = model(pred=pred, clean=clean_cond, lengths=lengths, labels=labels, decoder_attention_mask=decoder_attention_mask)
+        student_out = model(pred=input_mel, clean=clean_cond, lengths=lengths, labels=labels, decoder_attention_mask=decoder_attention_mask)
         decoder_input_ids = shift_tokens_right(labels, model.student.config.pad_token_id, model.student.config.decoder_start_token_id)
         teacher_out = teacher(
             input_features=clean,
@@ -332,7 +416,14 @@ def evaluate_oracle_model(
         hidden_kd = hidden_kd / max(len(selected_layers), 1)
         logit_kd = masked_kl(student_out["logits"], teacher_out.logits, decoder_attention_mask, temperature=1.0)
 
-        gen_ids, enc_dbg = model.generate(pred=pred, clean=clean_cond, lengths=lengths, num_beams=5, early_stopping=True, repetition_penalty=1.2)
+        gen_ids, enc_dbg = model.generate(
+            pred=input_mel,
+            clean=clean_cond,
+            lengths=lengths,
+            num_beams=eval_num_beams,
+            early_stopping=True,
+            repetition_penalty=1.2,
+        )
         pred_texts = processor.batch_decode(gen_ids, skip_special_tokens=True)
         ref_texts = tokenizer.batch_decode(labels_text_ids, skip_special_tokens=True)
 
@@ -367,53 +458,95 @@ def train_one_epoch_oracle(
     selected_layers,
     lambda_hidden_kd,
     lambda_logit_kd,
+    lambda_input_logit_kd,
     lambda_adapter_update,
     show_progress: bool,
     condition_source: str = "clean",
+    input_source: str = "pred",
     lambda_condition_contrast: float = 0.0,
     condition_contrast_margin: float = 0.02,
+    lambda_zero_condition_contrast: float = 0.0,
+    zero_condition_contrast_margin: float = 0.02,
+    contrast_every_n_batches: int = 1,
+    max_train_batches: int = 0,
 ):
     model.train()
     teacher.eval()
-    total_loss = asr_loss = hidden_kd_loss = logit_kd_loss = update_reg_loss = contrast_loss_total = 0.0
+    total_loss = asr_loss = hidden_kd_loss = logit_kd_loss = input_logit_kd_loss = update_reg_loss = contrast_loss_total = 0.0
     true_asr_contrast_loss = 0.0
     shuffled_asr_loss = 0.0
+    zero_asr_loss = 0.0
+    zero_contrast_loss_total = 0.0
     contrast_n = 0
+    zero_contrast_n = 0
     n = 0
     last_debug = None
     last_grad_norms = None
 
     desc = f"Training FiLM source={condition_source}"
-    for batch in tqdm(dataloader, desc=desc, disable=not show_progress):
-        pred = batch["pred"].to(device).float()
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc=desc, disable=not show_progress)):
+        if max_train_batches > 0 and batch_idx >= max_train_batches:
+            break
+        input_mel = batch[input_source].to(device).float()
         clean = batch["clean"].to(device).float()
         condition = batch[condition_source].to(device).float()
         lengths = batch["lengths"].to(device)
         labels = batch["labels"].to(device)
         decoder_attention_mask = batch["decoder_attention_mask"].to(device)
 
-        student_out = model(pred=pred, clean=condition, lengths=lengths, labels=labels, decoder_attention_mask=decoder_attention_mask)
-        decoder_input_ids = shift_tokens_right(labels, model.student.config.pad_token_id, model.student.config.decoder_start_token_id)
-        with torch.no_grad():
-            teacher_out = teacher(
-                input_features=clean,
-                decoder_input_ids=decoder_input_ids,
-                decoder_attention_mask=decoder_attention_mask,
-                output_hidden_states=True,
-                use_cache=False,
-                return_dict=True,
-            )
+        need_hidden_kd = lambda_hidden_kd > 0.0
+        need_logit_kd = lambda_logit_kd > 0.0
+        need_input_logit_kd = lambda_input_logit_kd > 0.0
+        need_teacher = need_hidden_kd or need_logit_kd
+        student_out = model(
+            pred=input_mel,
+            clean=condition,
+            lengths=lengths,
+            labels=labels,
+            decoder_attention_mask=decoder_attention_mask,
+            output_hidden_states=need_hidden_kd,
+            output_logits=need_logit_kd or need_input_logit_kd,
+        )
+        hidden_kd = torch.tensor(0.0, device=device)
+        logit_kd = torch.tensor(0.0, device=device)
+        input_logit_kd = torch.tensor(0.0, device=device)
+        decoder_input_ids = None
+        if need_teacher:
+            decoder_input_ids = shift_tokens_right(labels, model.student.config.pad_token_id, model.student.config.decoder_start_token_id)
+            with torch.no_grad():
+                teacher_out = teacher(
+                    input_features=clean,
+                    decoder_input_ids=decoder_input_ids,
+                    decoder_attention_mask=decoder_attention_mask,
+                    output_hidden_states=need_hidden_kd,
+                    use_cache=False,
+                    return_dict=True,
+                )
 
-        lengths_enc = torch.tensor([expected_encoder_len(int(L.item())) for L in lengths], device=device, dtype=torch.long)
-        hidden_kd = 0.0
-        for layer_idx in selected_layers:
-            hidden_kd = hidden_kd + masked_hidden_mse(
-                student_out["hidden_states"][layer_idx + 1],
-                teacher_out.encoder_hidden_states[layer_idx + 1],
-                lengths_enc,
-            )
-        hidden_kd = hidden_kd / max(len(selected_layers), 1)
-        logit_kd = masked_kl(student_out["logits"], teacher_out.logits, decoder_attention_mask, temperature=1.0)
+            if need_hidden_kd:
+                lengths_enc = torch.tensor([expected_encoder_len(int(L.item())) for L in lengths], device=device, dtype=torch.long)
+                for layer_idx in selected_layers:
+                    hidden_kd = hidden_kd + masked_hidden_mse(
+                        student_out["hidden_states"][layer_idx + 1],
+                        teacher_out.encoder_hidden_states[layer_idx + 1],
+                        lengths_enc,
+                    )
+                hidden_kd = hidden_kd / max(len(selected_layers), 1)
+            if need_logit_kd:
+                logit_kd = masked_kl(student_out["logits"], teacher_out.logits, decoder_attention_mask, temperature=1.0)
+        if need_input_logit_kd:
+            if decoder_input_ids is None:
+                decoder_input_ids = shift_tokens_right(labels, model.student.config.pad_token_id, model.student.config.decoder_start_token_id)
+            with torch.no_grad():
+                input_teacher_out = teacher(
+                    input_features=input_mel,
+                    decoder_input_ids=decoder_input_ids,
+                    decoder_attention_mask=decoder_attention_mask,
+                    output_hidden_states=False,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            input_logit_kd = masked_kl(student_out["logits"], input_teacher_out.logits, decoder_attention_mask, temperature=1.0)
 
         if student_out["adapter_debug"]:
             update_reg = torch.stack([d["layer_update_abs"] for d in student_out["adapter_debug"]]).mean()
@@ -422,13 +555,16 @@ def train_one_epoch_oracle(
 
         contrast_loss = torch.tensor(0.0, device=device)
         shuffled_loss = torch.tensor(0.0, device=device)
-        if lambda_condition_contrast > 0.0 and condition.shape[0] > 1:
+        zero_contrast_loss = torch.tensor(0.0, device=device)
+        zero_loss = torch.tensor(0.0, device=device)
+        do_extra_contrast = contrast_every_n_batches <= 1 or (batch_idx % contrast_every_n_batches == 0)
+        if do_extra_contrast and lambda_condition_contrast > 0.0 and condition.shape[0] > 1:
             perm = torch.randperm(condition.shape[0], device=condition.device)
             if torch.equal(perm, torch.arange(condition.shape[0], device=condition.device)):
                 perm = torch.roll(perm, shifts=1)
             shuffled_condition = condition[perm]
             shuffled_out = model(
-                pred=pred,
+                pred=input_mel,
                 clean=shuffled_condition,
                 lengths=lengths,
                 labels=labels,
@@ -439,13 +575,28 @@ def train_one_epoch_oracle(
             contrast_loss = F.relu(student_out["loss"] - shuffled_loss + condition_contrast_margin)
             true_asr_contrast_loss += float(student_out["loss"].detach().cpu().item())
             contrast_n += 1
+        if do_extra_contrast and lambda_zero_condition_contrast > 0.0:
+            zero_out = model(
+                pred=input_mel,
+                clean=input_mel,
+                lengths=lengths,
+                labels=labels,
+                decoder_attention_mask=decoder_attention_mask,
+                output_hidden_states=False,
+            )
+            zero_loss = zero_out["loss"]
+            zero_contrast_loss = F.relu(student_out["loss"] - zero_loss + zero_condition_contrast_margin)
+            zero_asr_loss += float(zero_loss.detach().cpu().item())
+            zero_contrast_n += 1
 
         loss = (
             student_out["loss"]
             + lambda_hidden_kd * hidden_kd
             + lambda_logit_kd * logit_kd
+            + lambda_input_logit_kd * input_logit_kd
             + lambda_adapter_update * update_reg
             + lambda_condition_contrast * contrast_loss
+            + lambda_zero_condition_contrast * zero_contrast_loss
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -457,8 +608,10 @@ def train_one_epoch_oracle(
         asr_loss += float(student_out["loss"].item())
         hidden_kd_loss += float(hidden_kd.detach().cpu().item())
         logit_kd_loss += float(logit_kd.detach().cpu().item())
+        input_logit_kd_loss += float(input_logit_kd.detach().cpu().item())
         update_reg_loss += float(update_reg.detach().cpu().item())
         contrast_loss_total += float(contrast_loss.detach().cpu().item())
+        zero_contrast_loss_total += float(zero_contrast_loss.detach().cpu().item())
         shuffled_asr_loss += float(shuffled_loss.detach().cpu().item()) if lambda_condition_contrast > 0.0 and condition.shape[0] > 1 else 0.0
         n += 1
 
@@ -484,11 +637,17 @@ def train_one_epoch_oracle(
         "train_asr_loss": asr_loss / max(n, 1),
         "train_hidden_kd_loss": hidden_kd_loss / max(n, 1),
         "train_logit_kd_loss": logit_kd_loss / max(n, 1),
+        "train_input_logit_kd_loss": input_logit_kd_loss / max(n, 1),
         "train_update_reg": update_reg_loss / max(n, 1),
         "train_condition_contrast_loss": contrast_loss_total / max(n, 1),
+        "train_zero_condition_contrast_loss": zero_contrast_loss_total / max(n, 1),
         "train_shuffled_asr_loss": shuffled_asr_loss / max(contrast_n, 1),
+        "train_zero_asr_loss": zero_asr_loss / max(zero_contrast_n, 1),
         "train_true_minus_shuffled_asr_loss": (
             (true_asr_contrast_loss - shuffled_asr_loss) / max(contrast_n, 1) if contrast_n > 0 else 0.0
+        ),
+        "train_true_minus_zero_asr_loss": (
+            (asr_loss - zero_asr_loss) / max(zero_contrast_n, 1) if zero_contrast_n > 0 else 0.0
         ),
         "last_grad_norms": last_grad_norms,
         "last_debug": last_debug,
@@ -515,12 +674,28 @@ def main():
     parser.add_argument("--adapter-bottleneck", type=int, default=128)
     parser.add_argument("--adapter-film-scale", type=float, default=0.25)
     parser.add_argument("--init-residual-scale", type=float, default=0.002)
-    parser.add_argument("--adapter-mode", choices=["residual_film", "direct_film"], default="residual_film")
+    parser.add_argument("--adapter-mode", choices=["residual_film", "direct_film", "gated_residual_film"], default="residual_film")
+    parser.add_argument("--conditioner-mode", choices=["full", "local_error", "global_error"], default="full")
     parser.add_argument("--lambda-hidden-kd", type=float, default=0.50)
     parser.add_argument("--lambda-logit-kd", type=float, default=0.20)
+    parser.add_argument("--lambda-input-logit-kd", type=float, default=0.0)
     parser.add_argument("--lambda-adapter-update", type=float, default=0.02)
-    parser.add_argument("--condition-source", choices=["clean", "reverb"], default="clean")
+    parser.add_argument("--lambda-condition-contrast", type=float, default=0.0)
+    parser.add_argument("--condition-contrast-margin", type=float, default=0.02)
+    parser.add_argument("--condition-contrast-warmup-epochs", type=int, default=0)
+    parser.add_argument("--lambda-zero-condition-contrast", type=float, default=0.0)
+    parser.add_argument("--zero-condition-contrast-margin", type=float, default=0.02)
+    parser.add_argument("--contrast-every-n-batches", type=int, default=1)
+    parser.add_argument("--max-train-batches", type=int, default=0)
+    parser.add_argument("--input-source", choices=["pred", "reverb", "clean"], default="pred")
+    parser.add_argument("--condition-source", choices=["clean", "pred", "reverb"], default="clean")
     parser.add_argument("--eval-condition-ablations", action="store_true")
+    parser.add_argument("--injection-position", choices=["after_layer", "before_layer"], default="after_layer")
+    parser.add_argument("--eval-num-beams", type=int, default=5)
+    parser.add_argument("--max-eval-batches", type=int, default=0)
+    parser.add_argument("--eval-ablation-frequency", type=int, default=1)
+    parser.add_argument("--skip-init-eval", action="store_true")
+    parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--show-progress", action="store_true")
     args = parser.parse_args()
 
@@ -565,17 +740,37 @@ def main():
         adapter_film_scale=args.adapter_film_scale,
         init_residual_scale=args.init_residual_scale,
         adapter_mode=args.adapter_mode,
+        conditioner_mode=args.conditioner_mode,
+        injection_position=args.injection_position,
     ).to(device)
 
     trainable = count_trainable_parameters(model)
-    experiment_name = "oracle_pred_clean_film" if args.condition_source == "clean" else "pred_reverb_film"
+    experiment_name = (
+        "oracle_pred_clean_film"
+        if args.input_source == "pred" and args.condition_source == "clean"
+        else f"{args.input_source}_input_{args.condition_source}_cond_film"
+    )
     print(
         json.dumps(
             {
                 "trainable_params": trainable,
                 "experiment": experiment_name,
+                "input_source": args.input_source,
                 "condition_source": args.condition_source,
                 "adapter_mode": args.adapter_mode,
+                "conditioner_mode": args.conditioner_mode,
+                "injection_position": args.injection_position,
+                "lambda_condition_contrast": args.lambda_condition_contrast,
+                "lambda_input_logit_kd": args.lambda_input_logit_kd,
+                "condition_contrast_margin": args.condition_contrast_margin,
+                "condition_contrast_warmup_epochs": args.condition_contrast_warmup_epochs,
+                "lambda_zero_condition_contrast": args.lambda_zero_condition_contrast,
+                "zero_condition_contrast_margin": args.zero_condition_contrast_margin,
+                "contrast_every_n_batches": args.contrast_every_n_batches,
+                "max_train_batches": args.max_train_batches,
+                "eval_num_beams": args.eval_num_beams,
+                "max_eval_batches": args.max_eval_batches,
+                "eval_ablation_frequency": args.eval_ablation_frequency,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -585,29 +780,94 @@ def main():
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
 
+    print("[PHASE] Evaluating validation baselines.", flush=True)
+    baseline_cache: Dict[str, Dict[str, float]] = {}
     baseline_pred_val = evaluate_baseline_pred(baseline_whisper, processor, tokenizer, val_dl, device, args.show_progress)
-    init_val = evaluate_oracle_model(
-        model,
-        teacher_whisper,
-        processor,
-        tokenizer,
-        val_dl,
-        device,
-        selected_layers,
-        args.show_progress,
-        condition_source=args.condition_source,
-    )
+    baseline_cache["pred"] = baseline_pred_val
+    if args.input_source in baseline_cache:
+        baseline_input_val = baseline_cache[args.input_source]
+    else:
+        baseline_input_val = evaluate_baseline_source(
+            baseline_whisper, processor, tokenizer, val_dl, device, args.input_source, args.show_progress
+        )
+        baseline_cache[args.input_source] = baseline_input_val
+    if "clean" in baseline_cache:
+        baseline_clean_val = baseline_cache["clean"]
+    else:
+        baseline_clean_val = evaluate_baseline_source(baseline_whisper, processor, tokenizer, val_dl, device, "clean", args.show_progress)
+        baseline_cache["clean"] = baseline_clean_val
+    init_val = None
+    if not args.skip_init_eval:
+        print("[PHASE] Evaluating initial FiLM model.", flush=True)
+        init_val = evaluate_oracle_model(
+            model,
+            teacher_whisper,
+            processor,
+            tokenizer,
+            val_dl,
+            device,
+            selected_layers,
+            args.show_progress,
+            condition_source=args.condition_source,
+            input_source=args.input_source,
+            eval_num_beams=args.eval_num_beams,
+            max_eval_batches=args.max_eval_batches,
+        )
 
     initial_summary = {
         "note": f"FiLM conditioning source: {args.condition_source}.",
         "pred_baseline_val": baseline_pred_val,
+        "input_baseline_val": baseline_input_val,
+        "clean_baseline_val": baseline_clean_val,
         f"{experiment_name}_init_val": init_val,
         "trainable_params": trainable,
         "selected_layers": selected_layers,
+        "input_source": args.input_source,
         "condition_source": args.condition_source,
         "adapter_mode": args.adapter_mode,
+        "conditioner_mode": args.conditioner_mode,
+        "injection_position": args.injection_position,
+        "lambda_input_logit_kd": args.lambda_input_logit_kd,
+        "lambda_condition_contrast": args.lambda_condition_contrast,
+        "condition_contrast_margin": args.condition_contrast_margin,
+        "condition_contrast_warmup_epochs": args.condition_contrast_warmup_epochs,
+        "lambda_zero_condition_contrast": args.lambda_zero_condition_contrast,
+        "zero_condition_contrast_margin": args.zero_condition_contrast_margin,
+        "contrast_every_n_batches": args.contrast_every_n_batches,
+        "max_train_batches": args.max_train_batches,
+        "eval_num_beams": args.eval_num_beams,
+        "max_eval_batches": args.max_eval_batches,
+        "eval_ablation_frequency": args.eval_ablation_frequency,
     }
     (out_dir / "initial_summary.json").write_text(json.dumps(initial_summary, indent=2), encoding="utf-8")
+
+    if args.eval_only:
+        eval_only_metrics = init_val
+        if eval_only_metrics is None:
+            print("[PHASE] Evaluating FiLM/wrapper model for eval-only run.", flush=True)
+            eval_only_metrics = evaluate_oracle_model(
+                model,
+                teacher_whisper,
+                processor,
+                tokenizer,
+                val_dl,
+                device,
+                selected_layers,
+                args.show_progress,
+                condition_source=args.condition_source,
+                input_source=args.input_source,
+                eval_num_beams=args.eval_num_beams,
+                max_eval_batches=args.max_eval_batches,
+            )
+        eval_only_summary = {
+            "initial": initial_summary,
+            "eval_only_val": eval_only_metrics,
+            "delta_vs_pred_baseline": float(eval_only_metrics["wer"] - baseline_pred_val["wer"]),
+            "delta_vs_input_baseline": float(eval_only_metrics["wer"] - baseline_input_val["wer"]),
+        }
+        (out_dir / "eval_only_summary.json").write_text(json.dumps(eval_only_summary, indent=2), encoding="utf-8")
+        print(json.dumps(eval_only_summary, ensure_ascii=False, separators=(",", ":")), flush=True)
+        return
 
     history: List[Dict] = []
     best_metrics = None
@@ -615,6 +875,12 @@ def main():
     no_improve = 0
 
     for epoch in range(1, args.epochs + 1):
+        print(f"[PHASE] Starting epoch {epoch}/{args.epochs}.", flush=True)
+        effective_lambda_condition_contrast = (
+            args.lambda_condition_contrast
+            if epoch > args.condition_contrast_warmup_epochs
+            else 0.0
+        )
         train_metrics = train_one_epoch_oracle(
             model=model,
             teacher=teacher_whisper,
@@ -624,10 +890,19 @@ def main():
             selected_layers=selected_layers,
             lambda_hidden_kd=args.lambda_hidden_kd,
             lambda_logit_kd=args.lambda_logit_kd,
+            lambda_input_logit_kd=args.lambda_input_logit_kd,
             lambda_adapter_update=args.lambda_adapter_update,
             show_progress=args.show_progress,
             condition_source=args.condition_source,
+            input_source=args.input_source,
+            lambda_condition_contrast=effective_lambda_condition_contrast,
+            condition_contrast_margin=args.condition_contrast_margin,
+            lambda_zero_condition_contrast=args.lambda_zero_condition_contrast,
+            zero_condition_contrast_margin=args.zero_condition_contrast_margin,
+            contrast_every_n_batches=args.contrast_every_n_batches,
+            max_train_batches=args.max_train_batches,
         )
+        print(f"[PHASE] Evaluating epoch {epoch} true condition.", flush=True)
         val_metrics = evaluate_oracle_model(
             model,
             teacher_whisper,
@@ -638,10 +913,17 @@ def main():
             selected_layers,
             args.show_progress,
             condition_source=args.condition_source,
+            input_source=args.input_source,
+            eval_num_beams=args.eval_num_beams,
+            max_eval_batches=args.max_eval_batches,
         )
         val_zero_metrics = None
         val_shuffled_metrics = None
-        if args.eval_condition_ablations:
+        do_eval_ablations = args.eval_condition_ablations and (
+            args.eval_ablation_frequency <= 1 or epoch % args.eval_ablation_frequency == 0
+        )
+        if do_eval_ablations:
+            print(f"[PHASE] Evaluating epoch {epoch} zero/shuffled condition ablations.", flush=True)
             val_zero_metrics = evaluate_oracle_model(
                 model,
                 teacher_whisper,
@@ -653,6 +935,9 @@ def main():
                 args.show_progress,
                 condition_mode="zero",
                 condition_source=args.condition_source,
+                input_source=args.input_source,
+                eval_num_beams=args.eval_num_beams,
+                max_eval_batches=args.max_eval_batches,
             )
             val_shuffled_metrics = evaluate_oracle_model(
                 model,
@@ -665,24 +950,42 @@ def main():
                 args.show_progress,
                 condition_mode="shuffled",
                 condition_source=args.condition_source,
+                input_source=args.input_source,
+                eval_num_beams=args.eval_num_beams,
+                max_eval_batches=args.max_eval_batches,
             )
 
         row = {
             "epoch": epoch,
             "lr": args.lr,
             "selected_layers": selected_layers,
+            "input_source": args.input_source,
             "condition_source": args.condition_source,
             "adapter_mode": args.adapter_mode,
+            "conditioner_mode": args.conditioner_mode,
+            "injection_position": args.injection_position,
             "lambda_hidden_kd": args.lambda_hidden_kd,
             "lambda_logit_kd": args.lambda_logit_kd,
+            "lambda_input_logit_kd": args.lambda_input_logit_kd,
             "lambda_adapter_update": args.lambda_adapter_update,
+            "lambda_condition_contrast": effective_lambda_condition_contrast,
+            "condition_contrast_margin": args.condition_contrast_margin,
+            "condition_contrast_warmup_epochs": args.condition_contrast_warmup_epochs,
+            "lambda_zero_condition_contrast": args.lambda_zero_condition_contrast,
+            "zero_condition_contrast_margin": args.zero_condition_contrast_margin,
+            "contrast_every_n_batches": args.contrast_every_n_batches,
+            "max_train_batches": args.max_train_batches,
+            "eval_num_beams": args.eval_num_beams,
+            "max_eval_batches": args.max_eval_batches,
+            "eval_ablation_frequency": args.eval_ablation_frequency,
             **{k: v for k, v in train_metrics.items() if k not in {"last_grad_norms", "last_debug"}},
             **{f"val_{k}": v for k, v in val_metrics.items()},
             "delta_vs_pred_baseline_wer": float(val_metrics["wer"] - baseline_pred_val["wer"]),
+            "delta_vs_input_baseline_wer": float(val_metrics["wer"] - baseline_input_val["wer"]),
             "last_grad_norms": train_metrics["last_grad_norms"],
             "last_debug": train_metrics["last_debug"],
         }
-        if args.eval_condition_ablations:
+        if do_eval_ablations:
             row["val_zero_condition_wer"] = val_zero_metrics["wer"]
             row["val_shuffled_condition_wer"] = val_shuffled_metrics["wer"]
             row["true_minus_zero_wer"] = float(val_metrics["wer"] - val_zero_metrics["wer"])
@@ -706,6 +1009,7 @@ def main():
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
 
+    print("[PHASE] Evaluating final validation and test summaries.", flush=True)
     final_val = evaluate_oracle_model(
         model,
         teacher_whisper,
@@ -716,8 +1020,13 @@ def main():
         selected_layers,
         args.show_progress,
         condition_source=args.condition_source,
-    )
+            input_source=args.input_source,
+            eval_num_beams=args.eval_num_beams,
+            max_eval_batches=args.max_eval_batches,
+        )
     test_pred = evaluate_baseline_pred(baseline_whisper, processor, tokenizer, test_dl, device, args.show_progress)
+    test_input = evaluate_baseline_source(baseline_whisper, processor, tokenizer, test_dl, device, args.input_source, args.show_progress)
+    test_clean = evaluate_baseline_source(baseline_whisper, processor, tokenizer, test_dl, device, "clean", args.show_progress)
     test_oracle = evaluate_oracle_model(
         model,
         teacher_whisper,
@@ -728,6 +1037,9 @@ def main():
         selected_layers,
         args.show_progress,
         condition_source=args.condition_source,
+        input_source=args.input_source,
+        eval_num_beams=args.eval_num_beams,
+        max_eval_batches=args.max_eval_batches,
     )
 
     final_summary = {
@@ -735,11 +1047,17 @@ def main():
         "initial": initial_summary,
         "final_val": final_val,
         "test_pred_baseline": test_pred,
+        "test_input_baseline": test_input,
+        "test_clean_baseline": test_clean,
         f"test_{experiment_name}": test_oracle,
         "best_val_metrics": best_metrics,
         "best_val_delta_vs_pred": float(best_metrics["wer"] - baseline_pred_val["wer"]) if best_metrics is not None else None,
         "test_delta_vs_pred": float(test_oracle["wer"] - test_pred["wer"]),
+        "test_delta_vs_input": float(test_oracle["wer"] - test_input["wer"]),
+        "input_source": args.input_source,
         "condition_source": args.condition_source,
+        "conditioner_mode": args.conditioner_mode,
+        "injection_position": args.injection_position,
     }
     (out_dir / "final_summary.json").write_text(json.dumps(final_summary, indent=2), encoding="utf-8")
     (out_dir / "final_report.txt").write_text(json.dumps(final_summary, indent=2), encoding="utf-8")

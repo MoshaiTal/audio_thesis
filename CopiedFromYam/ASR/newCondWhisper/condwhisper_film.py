@@ -292,7 +292,7 @@ class CPFiLMAdapter(nn.Module):
         adapter_mode: str = "residual_film",
     ):
         super().__init__()
-        if adapter_mode not in {"residual_film", "direct_film"}:
+        if adapter_mode not in {"residual_film", "direct_film", "gated_residual_film"}:
             raise ValueError(f"Unsupported adapter_mode: {adapter_mode}")
         self.film_scale = film_scale
         self.adapter_mode = adapter_mode
@@ -316,6 +316,13 @@ class CPFiLMAdapter(nn.Module):
             nn.init.normal_(mod.weight, mean=0.0, std=7e-4)
             nn.init.constant_(mod.bias, 0.0)
         self.log_residual_scale = nn.Parameter(torch.tensor(inv_softplus(init_residual_scale), dtype=torch.float32))
+        self.gate_net = nn.Sequential(
+            nn.Linear(d_model, bottleneck),
+            nn.GELU(),
+            nn.Linear(bottleneck, d_model),
+        )
+        nn.init.normal_(self.gate_net[-1].weight, mean=0.0, std=7e-4)
+        nn.init.constant_(self.gate_net[-1].bias, inv_softplus(init_residual_scale))
 
     def forward(self, x, cp_local, cp_global):
         cond = cp_local.transpose(1, 2) + cp_global[:, None, :]
@@ -331,6 +338,23 @@ class CPFiLMAdapter(nn.Module):
                 "delta_abs": (x_new - x).abs().mean(),
                 "film_delta_abs": (x_new - x).abs().mean(),
                 "mlp_delta_abs": torch.tensor(0.0, device=x.device, dtype=x.dtype),
+                "layer_update_abs": (x_new - x).abs().mean(),
+            }
+            return x_new, debug
+
+        if self.adapter_mode == "gated_residual_film":
+            gate = torch.sigmoid(self.gate_net(cond))
+            film_delta = z * gamma + beta
+            mlp_delta = torch.tanh(self.delta_net(z + film_delta))
+            delta = film_delta + 0.25 * mlp_delta
+            x_new = x + gate * delta
+            debug = {
+                "residual_scale": gate.mean(),
+                "gamma_abs": gamma.abs().mean(),
+                "beta_abs": beta.abs().mean(),
+                "delta_abs": delta.abs().mean(),
+                "film_delta_abs": film_delta.abs().mean(),
+                "mlp_delta_abs": mlp_delta.abs().mean(),
                 "layer_update_abs": (x_new - x).abs().mean(),
             }
             return x_new, debug
@@ -781,7 +805,7 @@ def main():
     parser.add_argument("--adapter-bottleneck", type=int, default=128)
     parser.add_argument("--adapter-film-scale", type=float, default=0.25)
     parser.add_argument("--init-residual-scale", type=float, default=0.002)
-    parser.add_argument("--adapter-mode", choices=["residual_film", "direct_film"], default="residual_film")
+    parser.add_argument("--adapter-mode", choices=["residual_film", "direct_film", "gated_residual_film"], default="residual_film")
     parser.add_argument("--lambda-hidden-kd", type=float, default=0.50)
     parser.add_argument("--lambda-logit-kd", type=float, default=0.20)
     parser.add_argument("--lambda-adapter-update", type=float, default=0.02)
