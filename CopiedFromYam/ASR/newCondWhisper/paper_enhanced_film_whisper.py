@@ -173,7 +173,13 @@ class PreLayerFiLM(nn.Module):
         nn.init.zeros_(self.beta[-1].bias)
         self.log_residual_scale = nn.Parameter(torch.tensor(inv_softplus(init_residual_scale), dtype=torch.float32))
 
-    def forward(self, hidden_states: torch.Tensor, cond_local: torch.Tensor, cond_global: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cond_local: torch.Tensor,
+        cond_global: torch.Tensor,
+        cond_key_padding_mask: Optional[torch.Tensor] = None,
+    ):
         cond = cond_local + cond_global[:, None, :]
         z = self.norm(hidden_states)
         gamma = self.film_scale * torch.tanh(self.gamma(cond))
@@ -212,11 +218,23 @@ class PreLayerSideCrossAttention(nn.Module):
         nn.init.zeros_(self.out[-1].bias)
         self.log_residual_scale = nn.Parameter(torch.tensor(inv_softplus(init_residual_scale), dtype=torch.float32))
 
-    def forward(self, hidden_states: torch.Tensor, cond_local: torch.Tensor, cond_global: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cond_local: torch.Tensor,
+        cond_global: torch.Tensor,
+        cond_key_padding_mask: Optional[torch.Tensor] = None,
+    ):
         cond = cond_local + cond_global[:, None, :]
         query = self.query_norm(hidden_states)
         key_value = self.cond_norm(cond)
-        attn_out, attn_weights = self.attn(query, key_value, key_value, need_weights=False)
+        attn_out, attn_weights = self.attn(
+            query,
+            key_value,
+            key_value,
+            key_padding_mask=cond_key_padding_mask,
+            need_weights=False,
+        )
         delta = self.out(attn_out)
         scale = F.softplus(self.log_residual_scale)
         out = hidden_states + scale * delta
@@ -270,6 +288,7 @@ class HookedEnhancedFiLMWhisper(nn.Module):
             })
         self._cond_local: Optional[torch.Tensor] = None
         self._cond_global: Optional[torch.Tensor] = None
+        self._cond_key_padding_mask: Optional[torch.Tensor] = None
         self._last_debug: List[Dict] = []
         self._handles = []
         self._register_hooks()
@@ -282,7 +301,12 @@ class HookedEnhancedFiLMWhisper(nn.Module):
                 if self._cond_local is None or self._cond_global is None:
                     return args
                 hidden = args[0]
-                new_hidden, dbg = self.adapters[str(layer_idx)](hidden, self._cond_local, self._cond_global)
+                new_hidden, dbg = self.adapters[str(layer_idx)](
+                    hidden,
+                    self._cond_local,
+                    self._cond_global,
+                    self._cond_key_padding_mask,
+                )
                 self._last_debug.append({"layer": layer_idx, **dbg})
                 return (new_hidden, *args[1:])
 
@@ -292,11 +316,16 @@ class HookedEnhancedFiLMWhisper(nn.Module):
         # Whisper's second encoder convolution downsamples by 2.
         target_len = (input_features.shape[-1] + 1) // 2
         self._cond_local, self._cond_global = self.conditioner(input_features, condition_features, lengths, target_len)
+        enc_lengths = ((lengths + 1) // 2).clamp(max=target_len)
+        cond_keep = make_time_mask(enc_lengths, target_len)
+        self._cond_local = self._cond_local * cond_keep[:, :, None].float()
+        self._cond_key_padding_mask = ~cond_keep
         self._last_debug = []
 
     def _clear_condition(self):
         self._cond_local = None
         self._cond_global = None
+        self._cond_key_padding_mask = None
 
     def forward(self, input_features, condition_features, lengths, labels, decoder_attention_mask):
         self._prepare_condition(input_features, condition_features, lengths)
